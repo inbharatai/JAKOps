@@ -1,5 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
-  "installCommand": "pnpm install --frozen-lockfile=false && pnpm --filter @jak-swarm/db db:generate"
+  "installCommand": "pnpm install --frozen-lockfile=false && pnpm --filter @jak-swarm/db db:generate && pnpm turbo run build --filter=@jak-swarm/swarm..."
 }
