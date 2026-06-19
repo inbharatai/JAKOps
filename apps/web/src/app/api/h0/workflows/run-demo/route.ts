@@ -37,8 +37,12 @@ export const maxDuration = 60;
  * H0 demo mode skips authentication for judge/demo access only.
  */
 
-const GOAL =
-  'Review a customer escalation about a delayed AI billing report, draft a professional empathetic reply, and send it to the customer by email.';
+const GOAL = [
+  'Customer escalation (complete brief — all context provided, no clarification needed):',
+  'Acme Corp (customer contact: jane.doe@acme.com) opened a priority ticket — their weekly AI billing report (report-id RPT-4471) was due Monday and is now 2 days late, which is blocking their month-end close.',
+  'Root cause on our side: a scheduled data sync from the payments connector stalled at 02:00 UTC Monday after a transient gateway timeout. The sync auto-retried, the report is regenerating now, and the ETA for the updated report is 30 minutes. We have added a monitor so future stalls alert the on-call team immediately.',
+  'Task: draft a professional, empathetic reply to the customer that (1) acknowledges the delay and its impact, (2) explains the root cause in plain language, (3) gives the 30-minute ETA and next steps, and (4) offers a contact if anything looks off once the report arrives. Then send that reply to the customer via email to jane.doe@acme.com.',
+].join(' ');
 
 // In-process, serverless-safe tool whitelist. Heavy server-only tools
 // (browser_*, file_*, code_execute, gmail_*, post_to_*, read_email) cannot run
