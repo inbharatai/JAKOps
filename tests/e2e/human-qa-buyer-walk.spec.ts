@@ -97,7 +97,7 @@ test('Human QA — buyer walkthrough', async () => {
             // The truth is grep-able in product-truth.ts via the api/tools/manifest
             // endpoint — but that requires API-up. Use a public-doc surface for
             // the buyer-walk: the README badge.
-            const r = await page.context().request.get('https://raw.githubusercontent.com/inbharatai/jak-swarm/main/README.md').catch(() => null);
+            const r = await page.context().request.get('https://raw.githubusercontent.com/inbharatai/JAKOps/main/README.md').catch(() => null);
             if (!r || !r.ok()) return { ok: false, evidence: 'README not reachable' };
             const text = await r.text();
             const ok = /Classified[_-]Tools[_-]?\d*[_-]?122|122 (?:Classified|Production) Tools/.test(text);

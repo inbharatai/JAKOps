@@ -42,7 +42,9 @@ describe('JAK Shield landing — truth-lock', () => {
   });
 
   it('JAKShield is wired into the landing page', () => {
-    const page = readFileSync(join(REPO_ROOT, 'apps/web/src/app/page.tsx'), 'utf8');
+    // The marketing landing is composed in MarketingHomePage.tsx (rendered by
+    // the root page in non-demo mode), so <JAKShield/> lives there now.
+    const page = readFileSync(join(REPO_ROOT, 'apps/web/src/components/landing/MarketingHomePage.tsx'), 'utf8');
     expect(page).toMatch(/<JAKShield\s*\/>/);
     expect(page).toMatch(/JAKShield/); // also imported
   });

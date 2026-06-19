@@ -491,14 +491,14 @@ export default function MarketingHomePage() {
               </Link>
               <div className="grid w-full sm:w-auto grid-cols-1 sm:grid-cols-2 gap-3">
                 <a
-                  href="https://github.com/inbharatai/jak-swarm"
+                  href="https://github.com/inbharatai/JAKOps"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="inline-flex w-full max-w-full items-center justify-center gap-2 rounded-xl border border-emerald-300/35 bg-emerald-400/10 px-6 py-4 text-base font-semibold text-white transition-all duration-200 hover:bg-emerald-400/15 hover:border-emerald-200/50 focus-visible:ring-2 focus-visible:ring-emerald-300/70"
-                  aria-label="View JAK Swarm repository on GitHub"
+                  aria-label="View JAKOps repository on GitHub"
                 >
                   <GitHubIcon className="h-5 w-5" />
-                  JAK Swarm Repo
+                  JAKOps Repo
                 </a>
                 <a
                   href="https://github.com/inbharatai/jak-shield"
@@ -513,7 +513,7 @@ export default function MarketingHomePage() {
               </div>
             </div>
             <p className="mt-3 text-[11px] text-slate-400 font-mono text-center">
-              Open-source repos: JAK Swarm (control plane) + JAK Shield (trust layer)
+              Open-source repos: JAKOps (control plane) + JAK Shield (trust layer)
             </p>
 
             {/* Trial trust line — every claim here is real and grep-able:
@@ -790,7 +790,7 @@ export default function MarketingHomePage() {
                   <li><a href="#how-it-works" className="hover:text-white focus-visible:text-white transition-colors">How It Works</a></li>
                   <li><a href="#audit" className="hover:text-white focus-visible:text-white transition-colors">Audit &amp; Compliance</a></li>
                   <li><a href="#pricing" className="hover:text-white focus-visible:text-white transition-colors">Pricing</a></li>
-                  <li><a href="https://github.com/inbharatai/jak-swarm" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors">Documentation</a></li>
+                  <li><a href="https://github.com/inbharatai/JAKOps" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors">Documentation</a></li>
                 </ul>
               </div>
 
@@ -798,9 +798,9 @@ export default function MarketingHomePage() {
               <div>
                 <h4 className="text-sm font-display font-semibold text-white mb-4">Company</h4>
                 <ul className="space-y-2.5 text-sm text-slate-500 font-sans">
-                  <li><a href="https://github.com/inbharatai/jak-swarm" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors">About</a></li>
-                  <li><a href="https://github.com/inbharatai/jak-swarm/blob/main/ARCHITECTURE.md" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors">Architecture</a></li>
-                  <li><a href="https://github.com/inbharatai/jak-swarm/blob/main/AGENTS.md" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors">Agent Docs</a></li>
+                  <li><a href="https://github.com/inbharatai/JAKOps" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors">About</a></li>
+                  <li><a href="https://github.com/inbharatai/JAKOps/blob/main/ARCHITECTURE.md" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors">Architecture</a></li>
+                  <li><a href="https://github.com/inbharatai/JAKOps/blob/main/AGENTS.md" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors">Agent Docs</a></li>
                   <li><a href="mailto:contact@inbharat.ai" className="hover:text-white focus-visible:text-white transition-colors">Contact</a></li>
                 </ul>
               </div>
@@ -810,9 +810,9 @@ export default function MarketingHomePage() {
                 <h4 className="text-sm font-display font-semibold text-white mb-4">Connect</h4>
                 <ul className="space-y-2.5 text-sm text-slate-500 font-sans">
                   <li>
-                    <a href="https://github.com/inbharatai/jak-swarm" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors inline-flex items-center gap-2" aria-label="JAK Swarm on GitHub">
+                    <a href="https://github.com/inbharatai/JAKOps" target="_blank" rel="noopener noreferrer" className="hover:text-white focus-visible:text-white transition-colors inline-flex items-center gap-2" aria-label="JAKOps on GitHub">
                       <GitHubIcon className="h-4 w-4" />
-                      GitHub · JAK Swarm
+                      GitHub · JAKOps
                     </a>
                   </li>
                   <li>

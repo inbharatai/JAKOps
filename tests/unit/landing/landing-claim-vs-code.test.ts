@@ -36,7 +36,7 @@ function contains(rel: string, pattern: RegExp | string): boolean {
 
 describe('Landing — Hero', () => {
   it('"Turn company context into approved agent work" hero copy is in the page', () => {
-    const page = read('apps/web/src/app/page.tsx');
+    const page = read('apps/web/src/components/landing/MarketingHomePage.tsx');
     expect(page).toContain('Turn company context');
     expect(page).toContain('into approved');
     expect(page).toContain('agent work');
@@ -44,7 +44,7 @@ describe('Landing — Hero', () => {
   });
 
   it('hero subheadline names the Company OS loop AND every security pillar', () => {
-    const src = read('apps/web/src/app/page.tsx');
+    const src = read('apps/web/src/components/landing/MarketingHomePage.tsx');
     for (const term of [
       'evidence',
       'decisions',
@@ -67,7 +67,7 @@ describe('Landing — Hero', () => {
   });
 
   it('JAK Shield chip in nav (desktop) AND mobile', () => {
-    const src = read('apps/web/src/app/page.tsx');
+    const src = read('apps/web/src/components/landing/MarketingHomePage.tsx');
     // Two distinct mentions: desktop nav + mobile menu
     const matches = src.match(/JAK Shield/g) ?? [];
     expect(matches.length, 'expected ≥ 2 occurrences (desktop + mobile nav)').toBeGreaterThanOrEqual(2);
@@ -80,7 +80,7 @@ describe('Landing — Company OS wedge (YC thesis, beta-honest)', () => {
 
   it('WhatJakDoes is exported and rendered on the live homepage', () => {
     expect(contains('apps/web/src/components/landing/index.ts', /export \{ default as WhatJakDoes \}/)).toBe(true);
-    expect(contains('apps/web/src/app/page.tsx', /<WhatJakDoes\s*\/>/)).toBe(true);
+    expect(contains('apps/web/src/components/landing/MarketingHomePage.tsx', /<WhatJakDoes\s*\/>/)).toBe(true);
     expect(contains(COMPANY, /id="company-os"/)).toBe(true);
   });
 
@@ -252,7 +252,7 @@ describe('Landing — JAK Shield (6 defenses) — the new front-and-center secti
   });
 
   it('JAK Shield IS wired into the live landing page (not just an unused component)', () => {
-    const page = read('apps/web/src/app/page.tsx');
+    const page = read('apps/web/src/components/landing/MarketingHomePage.tsx');
     expect(page).toMatch(/<JAKShield\s*\/>/);
     expect(page).toMatch(/href="#jak-shield"/);
   });
@@ -315,7 +315,7 @@ describe('Landing — top-line counts', () => {
   it('README declares challenge build status and current local verification evidence', () => {
     const readme = read('README.md');
     const beta = read('docs/beta-release.md');
-    const page = read('apps/web/src/app/page.tsx');
+    const page = read('apps/web/src/components/landing/MarketingHomePage.tsx');
     expect(readme).toMatch(/Release-Beta_0\.1\.0--beta\.0/);
     expect(readme).toContain('working challenge build');
     expect(readme).toMatch(/Tests-2154_blocking_CI/);
@@ -330,7 +330,7 @@ describe('Landing — top-line counts', () => {
 describe('Landing — public marketing copy stays honest', () => {
   it('NO "certified" / "HIPAA-ready" / "SOC 2-ready" claims on the landing or README', () => {
     const sources = [
-      'apps/web/src/app/page.tsx',
+      'apps/web/src/components/landing/MarketingHomePage.tsx',
       'apps/web/src/components/landing/JAKShield.tsx',
       'apps/web/src/components/landing/WhatJakDoes.tsx',
       'apps/web/src/components/landing/ShowTheWork.tsx',
@@ -385,14 +385,14 @@ describe('Landing — public marketing copy stays honest', () => {
 // ─────────────────────────────────────────────────────────────────────────
 describe('Landing — Free trial CTA (Migration 106)', () => {
   it('hero CTA is "Start 30-Day Free Trial" pointing at /trial', () => {
-    const page = read('apps/web/src/app/page.tsx');
+    const page = read('apps/web/src/components/landing/MarketingHomePage.tsx');
     expect(page).toMatch(/Start 30-Day Free Trial/);
     expect(page).toMatch(/href="\/trial"/);
     expect(page).toMatch(/data-cta="hero-trial"/);
   });
 
   it('hero trust line declares "No credit card" + "daily caps" + "30 days"', () => {
-    const page = read('apps/web/src/app/page.tsx');
+    const page = read('apps/web/src/components/landing/MarketingHomePage.tsx');
     expect(page).toMatch(/no credit card/i);
     expect(page).toMatch(/daily caps?/i);
     expect(page).toMatch(/30\s*day/i);

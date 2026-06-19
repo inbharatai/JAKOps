@@ -68,11 +68,35 @@ export async function proxy(request: NextRequest) {
     normalizeSupabaseProjectUrl(process.env['NEXT_PUBLIC_SUPABASE_URL']) &&
       process.env['NEXT_PUBLIC_SUPABASE_ANON_KEY'],
   );
-  if (
+  const demoMode =
     process.env['H0_DEMO_MODE'] === 'true' ||
     process.env['NEXT_PUBLIC_H0_DEMO_MODE'] === 'true' ||
-    !supabaseConfigured
-  ) {
+    !supabaseConfigured;
+
+  if (demoMode) {
+    // The demo module (/h0) uses no authentication — the dashboard is open and
+    // self-contained. Redirect the root and every auth/sign-in/trial route to
+    // /h0 so no login or sign-up UI is ever reachable in the demo. Everything
+    // else (the /h0 dashboard, /api/h0/*) passes straight through.
+    const pathname = request.nextUrl.pathname;
+    const AUTH_ROUTE_ROOTS = [
+      '/login',
+      '/register',
+      '/forgot-password',
+      '/reset-password',
+      '/trial',
+      '/onboarding',
+    ];
+    const isAuthRoute =
+      pathname === '/' ||
+      pathname.startsWith('/auth/') ||
+      AUTH_ROUTE_ROOTS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
+    if (isAuthRoute) {
+      const url = request.nextUrl.clone();
+      url.pathname = '/h0';
+      url.search = '';
+      return NextResponse.redirect(url);
+    }
     return NextResponse.next({ request });
   }
 

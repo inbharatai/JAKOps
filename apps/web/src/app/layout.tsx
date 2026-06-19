@@ -21,7 +21,7 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: 'JackOps — AI Operations Command Center',
   description:
-    'JackOps is an AI operations command center for startups and SMEs. Run, monitor, approve, secure, audit, and replay AI-agent workflows from one dashboard. H0 demo built on Vercel + Amazon Aurora PostgreSQL.',
+    'JackOps is an AI operations command center for startups and SMEs. Run, monitor, approve, secure, audit, and replay AI-agent workflows from one dashboard — powered by a registry of 38 agents and 122 classified tools. H0 demo built on Vercel + Amazon Aurora PostgreSQL.',
   keywords: ['AI operations', 'agent workflows', 'AI agents', 'approval gates', 'audit trail', 'agent control plane', 'JackOps', 'AI governance', 'workflow automation', 'risk intelligence'],
   authors: [{ name: 'JackOps' }],
   manifest: '/manifest.json',

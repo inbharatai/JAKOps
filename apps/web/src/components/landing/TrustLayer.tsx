@@ -55,7 +55,7 @@ const POINTS: TrustPoint[] = [
   {
     title: 'Self-hostable open-source core',
     body: 'JAK is MIT-licensed. Run it on your laptop, your VPS, or your cluster. Hosted ops are a convenience, not a lock-in.',
-    proof: 'github.com/inbharatai/jak-swarm · MIT',
+    proof: 'github.com/inbharatai/JAKOps · MIT',
     color: '#c084fc',
     iconPath: 'M12 3l8 4v6c0 5-3.5 9-8 10-4.5-1-8-5-8-10V7l8-4Z',
   },

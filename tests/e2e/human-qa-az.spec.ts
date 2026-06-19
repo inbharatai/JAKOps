@@ -77,7 +77,7 @@ test('Human QA — A-Z product audit (deep)', async () => {
           landingSelector: 'section[aria-label*="Get started" i]',
           landingTextRegex: /122/,
           dashboardCheck: async () => {
-            const r = await page.context().request.get('https://raw.githubusercontent.com/inbharatai/jak-swarm/main/README.md').catch(() => null);
+            const r = await page.context().request.get('https://raw.githubusercontent.com/inbharatai/JAKOps/main/README.md').catch(() => null);
             if (!r || !r.ok()) return { ok: false, evidence: 'README not reachable' };
             const text = await r.text();
             const ok = /Classified[_-]Tools[_-]?\d*[_-]?122|122 (?:Classified|Production) Tools/.test(text);

@@ -83,13 +83,13 @@ test.describe('HumanQA — landing page', () => {
       section: 'hero-ctas',
     });
     const githubHref = await page
-      .locator('section.gradient-bg a[href*="inbharatai/jak-swarm"]')
+      .locator('section.gradient-bg a[href*="inbharatai/JAKOps"]')
       .first()
       .getAttribute('href');
     qa.compareClaim({
-      claim: 'Hero "JAK Swarm Repo" CTA points at the canonical repo',
+      claim: 'Hero "JAKOps Repo" CTA points at the canonical repo',
       observed: String(githubHref),
-      matches: !!githubHref && githubHref.includes('inbharatai/jak-swarm'),
+      matches: !!githubHref && githubHref.includes('inbharatai/JAKOps'),
       section: 'hero-ctas',
     });
     const shieldHref = await page
