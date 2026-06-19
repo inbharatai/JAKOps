@@ -139,7 +139,7 @@ async function tryGenerateResponse(): Promise<{ text: string; source: string }> 
                 ],
               },
             ],
-          },
+          }),
         },
       );
       if (res.ok) {
