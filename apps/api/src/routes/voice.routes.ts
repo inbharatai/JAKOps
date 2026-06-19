@@ -1,0 +1,407 @@
+import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { ok, err } from '../types.js';
+import { AppError, NotFoundError, ForbiddenError } from '../errors.js';
+import { config } from '../config.js';
+
+const createSessionBodySchema = z.object({
+  language: z.string().default('en'),
+  voice: z.enum(['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']).default('alloy'),
+  workflowId: z.string().optional(),
+});
+
+const triggerWorkflowBodySchema = z.object({
+  goal: z.string().max(10000).optional(),
+  industry: z.string().max(100).optional(),
+  maxCostUsd: z.number().positive().optional(),
+});
+
+const VOICE_SESSION_TTL_SECONDS = 3600; // 1 hour
+
+const voiceRoutes: FastifyPluginAsync = async (fastify) => {
+  /**
+   * POST /voice/sessions
+   * Create a new voice session.
+   * Returns a sessionId and the WebRTC offer configuration for the OpenAI
+   * Realtime API (ICE servers, session token, model info).
+   */
+  fastify.post(
+    '/sessions',
+    { preHandler: [fastify.authenticate] },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const parseResult = createSessionBodySchema.safeParse(request.body);
+      if (!parseResult.success) {
+        return reply
+          .status(422)
+          .send(err('VALIDATION_ERROR', 'Invalid request body', parseResult.error.flatten()));
+      }
+
+      const { language, voice, workflowId } = parseResult.data;
+      const { userId, tenantId } = request.user;
+
+      // Generate a unique session id
+      const sessionId = `vs_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+      const sessionData = {
+        sessionId,
+        userId,
+        tenantId,
+        workflowId: workflowId ?? null,
+        language,
+        voice,
+        status: 'ACTIVE',
+        createdAt: new Date().toISOString(),
+      };
+
+      // Persist session metadata in Redis with a TTL
+      await fastify.redis.setex(
+        `voice:session:${sessionId}`,
+        VOICE_SESSION_TTL_SECONDS,
+        JSON.stringify(sessionData),
+      );
+
+      await fastify.auditLog(request, 'CREATE_VOICE_SESSION', 'VoiceSession', sessionId, {
+        workflowId,
+        language,
+        voice,
+      });
+
+      // Build the WebRTC offer configuration.
+      // The client uses these to connect to the OpenAI Realtime API directly.
+      //
+      // ICE strategy:
+      //   1. Google STUN as a baseline — works from residential + most
+      //      corporate networks with standard (non-symmetric) NAT.
+      //   2. Operator-provided TURN relay if configured via
+      //      VOICE_TURN_URL / VOICE_TURN_USERNAME / VOICE_TURN_CREDENTIAL —
+      //      required for symmetric NAT, restrictive firewalls, and
+      //      mobile carriers that block UDP. If any of the three env
+      //      vars is unset, TURN is silently omitted and we fall back
+      //      to STUN-only (documented in docs/demos/voice-to-workflow.md).
+      const iceServers: Array<{ urls: string; username?: string; credential?: string }> = [
+        { urls: 'stun:stun.l.google.com:19302' },
+      ];
+      if (config.voiceTurnUrl && config.voiceTurnUsername && config.voiceTurnCredential) {
+        iceServers.push({
+          urls: config.voiceTurnUrl,
+          username: config.voiceTurnUsername,
+          credential: config.voiceTurnCredential,
+        });
+      }
+
+      const webRtcConfig = {
+        model: config.openaiRealtimeModel,
+        voice,
+        language,
+        iceServers,
+        // The client should use this endpoint to exchange SDP with OpenAI
+        realtimeEndpoint: 'https://api.openai.com/v1/realtime',
+        // NEVER expose the raw API key to the client. Exchange a short-lived
+        // ephemeral token here via the OpenAI Realtime Sessions API.
+        ephemeralTokenEndpoint: `/voice/sessions/${sessionId}/token`,
+      };
+
+      return reply.status(201).send(ok({ sessionId, webRtcConfig, expiresInSeconds: VOICE_SESSION_TTL_SECONDS }));
+    },
+  );
+
+  /**
+   * GET /voice/sessions/:sessionId/token
+   * Obtain a short-lived ephemeral WebRTC token from the OpenAI Realtime API.
+   * The browser uses this token to connect directly to OpenAI — the raw API key
+   * is never sent to the client.
+   *
+   * Requires OPENAI_API_KEY to be set. Falls back to a mock token in development.
+   */
+  fastify.get(
+    '/sessions/:sessionId/token',
+    { preHandler: [fastify.authenticate] },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const { sessionId } = request.params as { sessionId: string };
+
+      try {
+        const raw = await fastify.redis.get(`voice:session:${sessionId}`);
+        if (!raw) throw new NotFoundError('VoiceSession', sessionId);
+
+        let session: { userId: string; tenantId: string; voice: string; language: string };
+        try {
+          session = JSON.parse(raw);
+        } catch {
+          throw new AppError(500, 'CORRUPTED_SESSION', 'Voice session data is corrupted');
+        }
+
+        if (
+          session.tenantId !== request.user.tenantId &&
+          request.user.role !== 'SYSTEM_ADMIN'
+        ) {
+          throw new ForbiddenError('Access to voice session in another tenant is not allowed');
+        }
+
+        // Refuse to issue a fake token. Previously this path emitted a
+        // synthesized placeholder + isMock flag when OPENAI_API_KEY was
+        // unset — a footgun: any frontend that forgot to check the flag
+        // would open a WebRTC session that silently never worked. 503 is
+        // safer, surfaced cleanly to the caller via VOICE_NOT_CONFIGURED.
+        if (!config.openaiApiKey) {
+          throw new AppError(
+            503,
+            'VOICE_NOT_CONFIGURED',
+            'Voice provider is not configured on this instance. Set OPENAI_API_KEY (or another supported realtime provider) and redeploy. For local development, export the env var before starting the API.',
+          );
+        }
+
+        // Exchange with OpenAI Realtime Sessions API for a real ephemeral token
+        const oaiResponse = await fetch('https://api.openai.com/v1/realtime/sessions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${config.openaiApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: config.openaiRealtimeModel,
+            voice: session.voice,
+            turn_detection: {
+              type: 'server_vad',
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 500,
+            },
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
+            language: session.language,
+          }),
+        });
+
+        if (!oaiResponse.ok) {
+          const body = await oaiResponse.text();
+          fastify.log.error({ sessionId, status: oaiResponse.status, body }, 'OpenAI Realtime session API error');
+          return reply.status(502).send(
+            err('VOICE_TOKEN_ERROR', 'Failed to obtain ephemeral token from OpenAI'),
+          );
+        }
+
+        const data = await oaiResponse.json() as {
+          id?: string;
+          client_secret?: { value?: string; expires_at?: number };
+        };
+
+        const clientToken = data.client_secret?.value ?? '';
+        const expiresAt = data.client_secret?.expires_at
+          ? new Date(data.client_secret.expires_at * 1000).toISOString()
+          : new Date(Date.now() + 60_000).toISOString();
+
+        return reply.status(200).send(
+          ok({
+            sessionId: data.id ?? sessionId,
+            clientToken,
+            model: config.openaiRealtimeModel,
+            expiresAt,
+            isMock: false,
+          }),
+        );
+      } catch (e) {
+        if (e instanceof AppError) return reply.status(e.statusCode).send(err(e.code, e.message));
+        throw e;
+      }
+    },
+  );
+
+  /**
+   * DELETE /voice/sessions/:sessionId
+   * End a voice session and remove it from Redis.
+   */
+  fastify.delete(
+    '/sessions/:sessionId',
+    { preHandler: [fastify.authenticate] },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const { sessionId } = request.params as { sessionId: string };
+
+      try {
+        const raw = await fastify.redis.get(`voice:session:${sessionId}`);
+        if (!raw) throw new NotFoundError('VoiceSession', sessionId);
+
+        let session: { userId: string; tenantId: string };
+        try { session = JSON.parse(raw); } catch { throw new AppError(500, 'CORRUPTED_SESSION', 'Voice session data is corrupted'); }
+
+        // Only the session owner or an admin may end the session
+        if (
+          session.userId !== request.user.userId &&
+          session.tenantId !== request.user.tenantId &&
+          request.user.role !== 'SYSTEM_ADMIN'
+        ) {
+          throw new ForbiddenError('Cannot end a voice session that does not belong to you');
+        }
+
+        await fastify.redis.del(`voice:session:${sessionId}`);
+        // Keep transcript key intact — it can still be retrieved after ending
+
+        await fastify.auditLog(request, 'END_VOICE_SESSION', 'VoiceSession', sessionId);
+
+        return reply.status(200).send(ok({ sessionId, status: 'ENDED' }));
+      } catch (e) {
+        if (e instanceof AppError) return reply.status(e.statusCode).send(err(e.code, e.message));
+        throw e;
+      }
+    },
+  );
+
+  /**
+   * GET /voice/sessions/:sessionId/transcript
+   * Retrieve the transcript for a completed or active voice session.
+   * Transcripts are stored in Redis under a separate key by the voice worker.
+   */
+  fastify.get(
+    '/sessions/:sessionId/transcript',
+    { preHandler: [fastify.authenticate] },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const { sessionId } = request.params as { sessionId: string };
+
+      try {
+        // Check the session exists (may already be expired/ended)
+        const sessionRaw = await fastify.redis.get(`voice:session:${sessionId}`);
+        const transcriptRaw = await fastify.redis.get(`voice:transcript:${sessionId}`);
+
+        if (!sessionRaw && !transcriptRaw) {
+          throw new NotFoundError('VoiceSession', sessionId);
+        }
+
+        // Parse session to check ownership
+        if (sessionRaw) {
+          let session: { userId: string; tenantId: string };
+          try { session = JSON.parse(sessionRaw); } catch { throw new AppError(500, 'CORRUPTED_SESSION', 'Voice session data is corrupted'); }
+          if (
+            session.tenantId !== request.user.tenantId &&
+            request.user.role !== 'SYSTEM_ADMIN'
+          ) {
+            throw new ForbiddenError('Access to voice session in another tenant is not allowed');
+          }
+        }
+
+        let transcript: Array<{ role: string; content: string; timestamp: string }> = [];
+        if (transcriptRaw) {
+          try { transcript = JSON.parse(transcriptRaw); } catch { transcript = []; }
+        }
+
+        return reply.status(200).send(ok({ sessionId, transcript }));
+      } catch (e) {
+        if (e instanceof AppError) return reply.status(e.statusCode).send(err(e.code, e.message));
+        throw e;
+      }
+    },
+  );
+
+  /**
+   * POST /voice/sessions/:sessionId/trigger-workflow
+   * Take a completed voice session's transcript and trigger a new
+   * JAK Swarm workflow with it. The transcript is joined into a single
+   * goal string or a structured prompt, then passed to executeAsync.
+   *
+   * Body (optional):
+   *   - goal: Custom goal to use instead of raw transcript
+   *   - industry: Industry pack to apply
+   *   - maxCostUsd: Max cost budget for the workflow
+   */
+  fastify.post(
+    '/sessions/:sessionId/trigger-workflow',
+    { preHandler: [fastify.authenticate] },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const { sessionId } = request.params as { sessionId: string };
+      const parsed = triggerWorkflowBodySchema.safeParse(request.body ?? {});
+      if (!parsed.success) {
+        return reply
+          .status(422)
+          .send(err('VALIDATION_ERROR', 'Invalid request body', parsed.error.flatten()));
+      }
+      const body = parsed.data;
+      const { userId, tenantId } = request.user;
+
+      try {
+        // 1. Retrieve session data (allows ended sessions — transcript may still exist)
+        const sessionRaw = await fastify.redis.get(`voice:session:${sessionId}`);
+        const transcriptRaw = await fastify.redis.get(`voice:transcript:${sessionId}`);
+
+        if (!sessionRaw && !transcriptRaw) {
+          throw new NotFoundError('VoiceSession', sessionId);
+        }
+
+        // 2. Ownership check
+        if (sessionRaw) {
+          let session: { tenantId: string };
+          try {
+            const parsed = JSON.parse(sessionRaw);
+            if (typeof parsed?.tenantId !== 'string') throw new Error('Missing tenantId');
+            session = parsed;
+          } catch {
+            throw new AppError(500, 'CORRUPTED_SESSION', 'Voice session data is corrupted');
+          }
+          if (session.tenantId !== tenantId && request.user.role !== 'SYSTEM_ADMIN') {
+            throw new ForbiddenError('Cannot trigger workflow from another tenant\'s voice session');
+          }
+        }
+
+        // 3. Build goal from transcript if none provided
+        let goal = body.goal?.trim() ?? '';
+        if (!goal && transcriptRaw) {
+          const segments = JSON.parse(transcriptRaw) as Array<{ role: string; content: string }>;
+          const userSegments = segments
+            .filter((s) => s.role === 'user')
+            .map((s) => s.content)
+            .join(' ')
+            .trim();
+          goal = userSegments || segments.map((s) => s.content).join(' ').trim();
+        }
+
+        if (!goal) {
+          return reply.status(400).send(err('EMPTY_TRANSCRIPT', 'No goal provided and voice transcript is empty'));
+        }
+
+        // Prefix for clarity in the DAG
+        const prefixedGoal = `[Voice Session ${sessionId}] ${goal}`;
+
+        // 4. Create workflow record
+        const workflow = await fastify.db.workflow.create({
+          data: {
+            tenantId,
+            userId,
+            goal: prefixedGoal,
+            status: 'PENDING',
+            stateJson: {
+              source: 'VOICE',
+              voiceSessionId: sessionId,
+              originalGoal: goal,
+            },
+            ...(body.maxCostUsd != null ? { maxCostUsd: body.maxCostUsd } : {}),
+          },
+        });
+
+        // 5. Fire-and-forget execution
+        setImmediate(() => {
+          void fastify.swarm.executeAsync({
+            workflowId: workflow.id,
+            tenantId,
+            userId,
+            goal: prefixedGoal,
+            industry: body.industry,
+            maxCostUsd: body.maxCostUsd,
+          });
+        });
+
+        await fastify.auditLog(request, 'VOICE_TRIGGER_WORKFLOW', 'Workflow', workflow.id, {
+          voiceSessionId: sessionId,
+        });
+
+        return reply.status(202).send(ok({
+          workflowId: workflow.id,
+          voiceSessionId: sessionId,
+          status: 'PENDING',
+          goal: prefixedGoal,
+        }));
+      } catch (e) {
+        if (e instanceof AppError) return reply.status(e.statusCode).send(err(e.code, e.message));
+        throw e;
+      }
+    },
+  );
+};
+
+export default voiceRoutes;

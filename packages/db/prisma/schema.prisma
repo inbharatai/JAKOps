@@ -1,0 +1,2172 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Tenant {
+  id                      String   @id @default(cuid())
+  name                    String
+  slug                    String   @unique
+  status                  String   @default("ACTIVE") // TenantStatus enum
+  plan                    String   @default("FREE")   // TenantPlan enum
+  industry                String?  // Industry enum
+  requireApprovals        Boolean  @default(true)
+  // When false (default for NEW tenants), every task routed to the approval
+  // node pauses for human review regardless of approvalThreshold. When true,
+  // tasks with risk strictly below approvalThreshold auto-approve. Existing
+  // tenants are back-filled to `true` in the migration to preserve behavior;
+  // only tenants created AFTER the migration get the strict default.
+  autoApproveEnabled      Boolean  @default(false)
+  approvalThreshold       String   @default("HIGH")   // RiskLevel
+  allowedDomains          String[] @default([])
+  maxConcurrentWorkflows  Int      @default(5)
+  enableVoice             Boolean  @default(true)
+  enableBrowserAutomation Boolean  @default(false)
+  disabledToolNames       String[] @default([])
+  logRetentionDays        Int      @default(90)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  users            User[]
+  conversations    Conversation[]
+  workflows        Workflow[]
+  workflowJobs     WorkflowJob[]
+  skills           Skill[]
+  auditLogs        AuditLog[]
+  memory           TenantMemory[]
+  memoryItems      MemoryItem[]
+  memoryEvents     MemoryEvent[]
+  apiKeys          ApiKey[]
+  integrations    Integration[]
+  oauthStates     OAuthState[]
+  whatsappLinks  WhatsappLink[]
+  onboardingState OnboardingState?
+  schedules       WorkflowSchedule[]
+  standingOrders  StandingOrder[]
+  projects        Project[]
+  vectorDocuments VectorDocument[]
+  tenantDocuments TenantDocument[]
+  subscription    Subscription?
+  companyProfile  CompanyProfile?
+  companyArtifacts CompanyArtifact[]
+  companyGraphEntities CompanyGraphEntity[]
+  executionDriftFindings ExecutionDriftFinding[]
+  agentExecutableSpecs AgentExecutableSpec[]
+  companyConnectorSyncStates CompanyConnectorSyncState[]
+  companyConnectorSyncRuns CompanyConnectorSyncRun[]
+  // Migration 106 — team + trial
+  departments     Department[]
+  taskAssignments TaskAssignment[]
+  notifications   Notification[]
+  trialSignup     TrialSignup?
+
+  @@map("tenants")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  email        String
+  name         String?
+  passwordHash String?
+  role         String   @default("END_USER") // UserRole enum
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  jobFunction  String?
+  avatarUrl    String?
+
+  // Migration 106 — Team + Trial.
+  // departmentId, jobTitle, managerId let us model a real org chart so a CEO
+  // can assign tasks to "the HR team" or "@anita" and the inbox / org-chart
+  // UI can render hierarchy. All three are nullable so existing rows keep
+  // working unchanged. managerId is a self-FK; we deliberately do NOT cascade
+  // on delete — when a manager leaves, their reports become managerless
+  // (status, not crash) until a TENANT_ADMIN reassigns them.
+  departmentId String?
+  jobTitle     String?
+  managerId    String?
+
+  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  sessions     Session[]
+  conversations Conversation[]
+  workflows    Workflow[]
+  workflowJobs WorkflowJob[]
+  approvals ApprovalRequest[] @relation("reviewer")
+  projects  Project[]
+  whatsappLinks WhatsappLink[]
+  // Migration 106 relations
+  department         Department?      @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  manager            User?            @relation("UserManagerSelf", fields: [managerId], references: [id], onDelete: SetNull)
+  reports            User[]           @relation("UserManagerSelf")
+  taskAssignments    TaskAssignment[] @relation("TaskAssignmentAssignee")
+  taskAssignmentsCreated TaskAssignment[] @relation("TaskAssignmentAssigner")
+  notifications      Notification[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId, departmentId])
+  @@index([tenantId, managerId])
+  @@map("users")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  tenantId   String
+  name       String
+  keyHash    String    @unique
+  scopes     String[]  @default([])
+  expiresAt  DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([expiresAt])
+  @@map("api_keys")
+}
+
+model Workflow {
+  id             String    @id @default(cuid())
+  tenantId       String
+  userId         String
+  conversationId String?
+  goal           String
+  industry      String?
+  status        String    @default("PENDING") // WorkflowStatus
+  planJson      Json?     // WorkflowPlan serialized
+  currentTaskId String?
+  error         String?
+  stateJson     Json?
+  finalOutput   String?   @db.Text
+  totalCostUsd  Float     @default(0)
+  maxCostUsd    Float?
+  startedAt     DateTime  @default(now())
+  completedAt   DateTime?
+  updatedAt     DateTime  @updatedAt
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // P0-1 (audit 2026-05-08): the migration declares ON DELETE RESTRICT; the
+  // schema previously omitted the clause which silently let Prisma assume
+  // "no rule" — a truth-of-record lie. Now matches the live DB constraint.
+  user             User              @relation(fields: [userId], references: [id], onDelete: Restrict)
+  traces           AgentTrace[]
+  approvalRequests ApprovalRequest[]
+  jobs             WorkflowJob[]
+  artifacts        WorkflowArtifact[]
+  conversation     Conversation?     @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  messages         ConversationMessage[]
+
+  @@index([tenantId, status])
+  @@index([updatedAt])
+  @@index([conversationId])
+  @@map("workflows")
+}
+
+// Hardening pass — foundation for the Audit & Compliance product.
+//
+// A WorkflowArtifact is a customer-deliverable evidence artefact produced
+// by a workflow run: the final output (markdown), an exported PDF/DOCX/CSV,
+// a worker-generated file, an evidence bundle ZIP, etc. Distinct from
+// AgentTrace (per-step internal record) and TenantDocument (user-uploaded
+// inputs) — both of which already exist.
+//
+// Storage policy:
+//   - Small text/JSON artefacts: stored inline in `inlineContent` (≤256KB).
+//   - Larger binary artefacts: stored in Supabase Storage at `storageKey`
+//     under bucket `tenant-artifacts/<tenantId>/<workflowId>/<id>.<ext>`.
+//   - Both fields can be null while `status='PENDING'` (artifact row created
+//     before the file is materialised — see `artifact.service.ts`).
+//
+// Approval gating:
+//   - `approvalState='REQUIRES_APPROVAL'` means the artifact was produced
+//     by a high-risk workflow and must NOT be downloaded until reviewed.
+//   - Download routes MUST check approvalState before signing a URL.
+model WorkflowArtifact {
+  id              String    @id @default(cuid())
+  tenantId        String
+  workflowId      String
+  // Optional — when an artifact corresponds to a single workflow task.
+  taskId          String?
+  // Who/what produced the artifact. Worker role for agent output, 'system'
+  // for export bundles, the user id for explicit user uploads.
+  producedBy      String
+  // Stable type label used by the audit UI for filtering. Open vocabulary
+  // because the Audit & Compliance product will introduce new types
+  // (evidence_bundle, control_attestation, signed_export, etc.) without
+  // a Prisma migration each time.
+  artifactType    String    // e.g. 'final_output' | 'export' | 'evidence_bundle' | 'attachment'
+  // Human-friendly file name shown in the UI.
+  fileName        String
+  mimeType        String
+  // Total size in bytes. NULL until the artifact materializes.
+  sizeBytes       Int?
+  // sha256 of the bytes — for integrity check + dedupe across a tenant.
+  contentHash     String?
+  // For small text/JSON artefacts kept inline. Null for binary objects in storage.
+  inlineContent   String?   @db.Text
+  // Supabase Storage key for binary objects. Null for inline-only.
+  storageKey      String?   @unique
+  // Lifecycle:
+  //   PENDING   — row created, file not yet written
+  //   READY     — file materialised (inline or storage), download allowed pending approval
+  //   FAILED    — production failed; see `error`
+  //   DELETED   — soft-delete, blob removed but row stays for audit trail
+  status          String    @default("PENDING")
+  // Compliance gate. The Audit & Compliance product reads this to enforce
+  // "evidence cannot be exported until human-approved" workflows.
+  //   NOT_REQUIRED         — artifact is non-sensitive, downloadable freely
+  //   REQUIRES_APPROVAL    — approval gate active; download blocked
+  //   APPROVED             — reviewer approved download
+  //   REJECTED             — reviewer blocked download permanently
+  approvalState   String    @default("NOT_REQUIRED")
+  // When approvalState transitions to APPROVED/REJECTED, who decided.
+  approvedBy      String?
+  approvedAt      DateTime?
+  // Audit field — last user who DOWNLOADED. Per-download events live in AuditLog.
+  lastDownloadedBy String?
+  lastDownloadedAt DateTime?
+  // For multi-format exports — track the source artifact ID.
+  // E.g. a PDF export of an evidence_bundle ZIP keeps `parentId` pointing at the bundle.
+  parentId        String?
+  // Free-form metadata the producer wants stamped on the row (workflow step
+  // id, source dataset version, signing key id, etc.).
+  metadata        Json?
+  error           String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  // Soft-delete marker. Hard-delete is reserved for retention sweeps.
+  deletedAt       DateTime?
+
+  workflow        Workflow  @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  parent          WorkflowArtifact? @relation("ArtifactParent", fields: [parentId], references: [id], onDelete: SetNull)
+  derivatives     WorkflowArtifact[] @relation("ArtifactParent")
+
+  @@index([tenantId, deletedAt])
+  @@index([workflowId])
+  @@index([tenantId, artifactType])
+  @@index([tenantId, status])
+  @@map("workflow_artifacts")
+}
+
+// Conversation thread memory for the main JAK chat.
+// One conversation spans multiple workflow runs; each workflow links back
+// to its parent conversation so checkpoints can replay with full context.
+model Conversation {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user     User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages ConversationMessage[]
+  workflows Workflow[]
+
+  @@index([tenantId, userId, updatedAt])
+  @@map("conversations")
+}
+
+model ConversationMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  workflowId     String?
+  role           String   // "user" | "assistant" | "system"
+  content        String   @db.Text
+  agentRole      String?  // worker role label for assistant messages
+  metadata       Json?    // cost, tokens, traceId, etc.
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  workflow     Workflow?    @relation(fields: [workflowId], references: [id], onDelete: SetNull)
+
+  @@index([conversationId, createdAt])
+  @@map("conversation_messages")
+}
+
+model WorkflowJob {
+  id               String   @id @default(cuid())
+  workflowId       String   @unique
+  tenantId         String
+  userId           String
+  status           String   @default("QUEUED") // QUEUED | ACTIVE | COMPLETED | FAILED | DEAD
+  attempts         Int      @default(0)
+  maxAttempts      Int      @default(5)
+  payloadJson      Json
+  availableAt      DateTime @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
+  lastError        String?
+  // P1b ownership — which instance owns the job right now, when its lease expires,
+  // and when it last heartbeated. Reclaim when leaseExpiresAt < NOW() and status='ACTIVE'.
+  ownerInstanceId  String?
+  leaseExpiresAt   DateTime?
+  lastHeartbeatAt  DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, availableAt])
+  @@index([tenantId, status])
+  @@index([updatedAt])
+  @@index([status, leaseExpiresAt])
+  @@index([ownerInstanceId])
+  @@map("workflow_jobs")
+}
+
+model AgentTrace {
+  id            String    @id @default(cuid())
+  traceId       String
+  runId         String
+  workflowId    String
+  tenantId      String
+  agentRole     String    // AgentRole enum
+  stepIndex     Int
+  inputJson     Json?
+  outputJson    Json?
+  toolCallsJson Json?
+  handoffsJson  Json?
+  startedAt     DateTime
+  completedAt   DateTime?
+  durationMs    Int?
+  tokenUsage    Json?
+  error         String?
+
+  workflow      Workflow  @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId])
+  @@index([traceId])
+  @@index([tenantId])
+  @@map("agent_traces")
+}
+
+model ApprovalRequest {
+  id               String    @id @default(cuid())
+  workflowId       String
+  tenantId         String
+  taskId           String
+  agentRole        String
+  action           String
+  rationale        String
+  proposedDataJson Json?
+  riskLevel        String    @default("HIGH")
+  status           String    @default("PENDING") // PENDING | APPROVED | REJECTED | DEFERRED
+  comment          String?
+  reviewedBy       String?
+  reviewedAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  // Item B fields (OpenClaw-inspired Phase 1) — give the approval card
+  // enough context for a reviewer to make an informed decision AND bind
+  // the approval to a specific payload so a caller can't replay the same
+  // approvalId for a different proposedData.
+  //
+  // proposedDataHash is sha256 of the canonicalised proposedDataJson at
+  // approval-creation time. The decide route compares the hash of the
+  // CURRENTLY-stored proposedData to this value and returns 409 if they
+  // differ — preventing the "approve once, replay with different
+  // payload" exploit.
+  proposedDataHash String?
+  toolName         String?   // The tool the action will invoke (e.g. "send_email", "stripe_charge")
+  filesAffected    String[]  // Files this action will write to / overwrite
+  externalService  String?   // External system this action targets (e.g. "Slack", "Stripe", "GitHub")
+  idempotencyKey   String?   // Dedup key — retrying the decide for the same key is a no-op
+  expectedResult   String?   // 1-line preview of what success looks like, surfaced in the card
+
+  workflow         Workflow  @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  reviewer         User?     @relation("reviewer", fields: [reviewedBy], references: [id])
+  approvalScopes   ApprovalScope[]
+
+  @@index([workflowId, status])
+  @@index([tenantId, status])
+  @@index([proposedDataHash])
+  @@map("approval_requests")
+}
+
+// Item B: ApprovalScope — one row per approval decision, persists the
+// payload-hash that was decided. The decide route writes this row inside
+// the same transaction as the ApprovalRequest status update. Subsequent
+// retries with a different proposedDataHash are rejected because the
+// route looks up the canonical hash from this table.
+//
+// The (approvalId, proposedDataHash) composite is unique — replaying the
+// SAME hash is an idempotent no-op (returns the original decision);
+// replaying a DIFFERENT hash triggers APPROVAL_PAYLOAD_MISMATCH.
+model ApprovalScope {
+  id               String    @id @default(cuid())
+  approvalId       String
+  proposedDataHash String
+  decidedAt        DateTime  @default(now())
+  decision         String    // APPROVED | REJECTED | DEFERRED
+  approverId       String?
+
+  approval         ApprovalRequest @relation(fields: [approvalId], references: [id], onDelete: Cascade)
+
+  @@unique([approvalId, proposedDataHash])
+  @@index([approvalId])
+  @@map("approval_scopes")
+}
+
+// Append-only audit log of every approval decision ever made, including
+// auto-approvals, rejections, deferrals, and human approvals. This is the
+// source of truth for compliance queries ("prove who approved action X on
+// date Y") and for observing tenant auto-approve behaviour over time.
+//
+// Rows are NEVER deleted except via explicit data-retention jobs; updating
+// the ApprovalRequest row does not mutate the history recorded here.
+model ApprovalAuditLog {
+  id             String   @id @default(cuid())
+  approvalId     String   // FK to ApprovalRequest (soft ref — kept even after request cleanup)
+  workflowId     String
+  tenantId       String
+  taskId         String
+  agentRole      String
+  riskLevel      String
+  decision       String   // APPROVED | REJECTED | DEFERRED | AUTO_APPROVED
+  autoApproved   Boolean  @default(false)
+  approverId     String?  // null for auto-approvals
+  rationale      String?
+  rawDecisionJson Json?   // full request body for forensic debugging
+  decidedAt      DateTime @default(now())
+
+  @@index([tenantId, decidedAt])
+  @@index([workflowId])
+  @@index([approvalId])
+  @@map("approval_audit_logs")
+}
+
+model Skill {
+  id               String    @id @default(cuid())
+  tenantId         String?   // null = global built-in
+  name             String
+  description      String
+  tier             Int       @default(1) // SkillTier
+  status           String    @default("PROPOSED") // SkillStatus
+  inputSchemaJson  Json?
+  outputSchemaJson Json?
+  permissions      String[]  @default([])
+  riskLevel        String    @default("MEDIUM")
+  testCasesJson    Json?
+  implementation   String?   // source code — only for sandbox
+  sandboxResult    Json?
+  approvedBy       String?
+  approvedAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  tenant           Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@map("skills")
+}
+
+model TenantMemory {
+  id         String    @id @default(cuid())
+  tenantId   String
+  key        String
+  value      Json
+  source     String    // who/what wrote it
+  memoryType String    // WORKFLOW | USER_PREF | KNOWLEDGE | POLICY | SKILL_REGISTRY
+  expiresAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, key])
+  @@index([tenantId, memoryType])
+  @@map("tenant_memory")
+}
+
+model MemoryItem {
+  id             String    @id @default(cuid())
+  tenantId       String
+  scopeType      String
+  scopeId        String
+  key            String
+  value          Json
+  memoryType     String
+  confidence     Float?
+  source         String?
+  sourceRunId    String?
+  idempotencyKey String?
+  contentHash    String?
+  version        Int       @default(1)
+  expiresAt      DateTime?
+  // Approval status — added in migration 16. Existing rows default to
+  // 'user_approved' (backward compat: any pre-existing memory was
+  // necessarily user-curated since there was no agent-suggestion flow).
+  // - 'extracted'      : auto-extracted from documents/website, awaits review
+  // - 'suggested'      : agent proposed during a workflow run, awaits review
+  // - 'user_approved'  : reviewer or user explicitly approved (only these
+  //                     are loaded into agent prompts via grounding)
+  // - 'rejected'       : reviewer explicitly rejected; never re-suggested
+  status         String    @default("user_approved")
+  // Who suggested it (when status='suggested') or extracted (when 'extracted')
+  suggestedBy    String?
+  // Who approved/rejected
+  reviewedBy     String?
+  reviewedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+  lastAccessedAt DateTime?
+
+  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  events         MemoryEvent[]
+
+  @@unique([tenantId, scopeType, scopeId, key])
+  @@index([tenantId, scopeType, scopeId])
+  @@index([tenantId, memoryType])
+  @@index([tenantId, status])
+  @@index([tenantId, updatedAt])
+  @@index([tenantId, deletedAt])
+  @@map("memory_items")
+}
+
+model MemoryEvent {
+  id             String    @id @default(cuid())
+  tenantId       String
+  memoryItemId   String?
+  scopeType      String
+  scopeId        String
+  key            String
+  action         String
+  actorId        String?
+  runId          String?
+  idempotencyKey String?
+  diff           Json?
+  createdAt      DateTime  @default(now())
+
+  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  memoryItem     MemoryItem? @relation(fields: [memoryItemId], references: [id], onDelete: SetNull)
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, action])
+  @@map("memory_events")
+}
+
+model VectorDocument {
+  id         String   @id @default(cuid())
+  tenantId   String
+  content    String   @db.Text
+  // embedding stored via raw SQL (pgvector); Prisma doesn't natively support vector type
+  metadata   Json?
+  sourceKey  String?
+  sourceType String   @default("DOCUMENT")
+  chunkIndex Int      @default(0)
+  scopeType  String?
+  scopeId    String?
+  contentHash String?
+  // Soft FK to TenantDocument.id — when a file is uploaded via POST /documents/upload,
+  // each chunk row carries the originating document id so we can list chunks by
+  // document (preview) and delete chunks when the document is removed.
+  documentId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, sourceType])
+  @@index([tenantId, scopeType, scopeId])
+  @@index([tenantId, sourceKey])
+  @@index([documentId])
+  @@map("vector_documents")
+}
+
+// Source-of-truth record for every file a tenant uploads via the dashboard.
+// The raw bytes live in Supabase Storage under `tenant-documents/<tenantId>/<id>.<ext>`;
+// this table holds the metadata + the URL the frontend uses to stream the file
+// back. Chunked + embedded content lives in VectorDocument rows joined on documentId.
+//
+// Why a dedicated model instead of reusing VectorDocument: VectorDocument is
+// chunk-level (one row per ~1k tokens). TenantDocument is document-level (one
+// row per uploaded file). Treating them as the same thing makes preview, delete,
+// and "recently uploaded files" queries awkward. Keeping them separate makes
+// the lifecycle clear: upload creates 1 TenantDocument + N VectorDocument rows.
+model TenantDocument {
+  id           String   @id @default(cuid())
+  tenantId     String
+  // Uploader — null when uploaded via API key (future: service-account uploads)
+  uploadedBy   String?
+  fileName     String
+  // MIME type from Content-Type, validated against an allowlist at upload time.
+  mimeType     String
+  sizeBytes   Int
+  // Supabase Storage key: `tenant-documents/<tenantId>/<id>.<ext>`. Frontend
+  // builds the signed URL at read-time so we never persist a URL that could
+  // outlive its signature.
+  storageKey   String   @unique
+  // Hash of the file content (sha256, hex). Lets us dedupe identical uploads
+  // across a tenant and detect silent corruption.
+  contentHash  String?
+  // Ingestion lifecycle:
+  //   PENDING   — uploaded, not yet chunked/embedded
+  //   INDEXED   — chunks live in VectorDocument, searchable
+  //   FAILED    — ingestion failed, see ingestionError for reason
+  //   DELETED   — soft-delete marker; storage object also removed
+  status       String   @default("PENDING")
+  ingestionError String?
+  // Optional scope labels set at upload — e.g., { projectId, workflowId }
+  // so the find_document tool can filter to the right context.
+  metadata     Json?
+  // Optional tags the user attaches at upload for organization in the Files tab.
+  tags         String[] @default([])
+  // Soft delete — storage object is still removed, this row stays for audit.
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, deletedAt])
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt])
+  @@map("tenant_documents")
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String
+  userId     String?
+  action     String
+  resource   String
+  resourceId String?
+  details    Json?
+  ip         String?
+  userAgent  String?
+  severity   String   @default("INFO") // INFO | WARN | ERROR | CRITICAL
+  createdAt  DateTime @default(now())
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, action])
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+/// Layman-friendly connection status taxonomy enforced at the DB level.
+/// Migration `105_integration_status_enum` converts the prior free-form
+/// String column to this enum. Backfill: legacy 'DISCONNECTED' →
+/// NOT_CONNECTED; anything unrecognised → NOT_CONNECTED.
+///
+/// Front-end normalizer at `apps/web/src/lib/connection-status.ts` maps
+/// these to user-facing labels (Connected / Reconnect needed /
+/// Permission needed / Coming soon). The enum is the source of truth;
+/// the normalizer is the UI translation only.
+enum ConnectionStatus {
+  CONNECTED
+  NOT_CONNECTED
+  NEEDS_REAUTH
+  EXPIRED
+  ERROR
+  PENDING
+}
+
+model Integration {
+  id          String           @id @default(cuid())
+  tenantId    String
+  provider    String
+  status      ConnectionStatus @default(CONNECTED)
+  displayName String?
+  scopes      String[]         @default([])
+  metadata    Json?
+  lastUsedAt  DateTime?
+  connectedBy String
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  credentials IntegrationCredential?
+
+  @@unique([tenantId, provider])
+  @@index([tenantId, status])
+  @@map("integrations")
+}
+
+model IntegrationCredential {
+  id              String      @id @default(cuid())
+  integrationId   String      @unique
+  accessTokenEnc  String
+  refreshTokenEnc String?
+  expiresAt       DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  integration     Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@map("integration_credentials")
+}
+
+// Short-lived row created when a tenant starts an OAuth authorization flow
+// (e.g. "Sign in with Google"). Stores the CSRF `state` token + the PKCE
+// `codeVerifier` until the provider redirects back to the callback, at which
+// point the row is read once and deleted. TTL enforced by the callback
+// handler; a background sweeper can drop rows with expiresAt < now().
+model OAuthState {
+  id           String   @id @default(cuid())
+  tenantId     String
+  userId       String
+  provider     String
+  state        String   @unique
+  codeVerifier String
+  redirectUri  String
+  scopes       String[] @default([])
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([expiresAt])
+  @@map("oauth_states")
+}
+
+model WhatsappLink {
+  id          String   @id @default(cuid())
+  tenantId    String
+  userId      String
+  phoneNumber String
+  status      String   @default("PENDING")
+  challengeCode String?
+  challengeExpiresAt DateTime?
+  verifiedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([phoneNumber])
+  @@unique([tenantId, userId])
+  @@index([tenantId])
+  @@map("whatsapp_links")
+}
+
+model OnboardingState {
+  id             String   @id @default(cuid())
+  tenantId       String   @unique
+  completedSteps String[] @default([])
+  dismissed      Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("onboarding_states")
+}
+
+model WorkflowSchedule {
+  id              String    @id @default(cuid())
+  tenantId        String
+  userId          String
+  name            String
+  description     String?
+  goal            String
+  industry        String?
+  cronExpression  String
+  enabled         Boolean   @default(true)
+  maxCostUsd      Float?
+  lastRunAt       DateTime?
+  nextRunAt       DateTime?
+  lastRunStatus   String?
+  lastRunId       String?
+  runCount        Int       @default(0)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Item C (OpenClaw-inspired Phase 1) — at most one StandingOrder per
+  // schedule. The relation is optional on both sides: a schedule can fire
+  // without a standing-order boundary, and a standing-order can apply to
+  // a tenant globally without being attached to a specific schedule.
+  standingOrders  StandingOrder[]
+
+  @@index([tenantId, enabled])
+  @@index([nextRunAt])
+  @@map("workflow_schedules")
+}
+
+// Item C (OpenClaw-inspired Phase 1) — Standing Orders.
+//
+// A StandingOrder is a per-tenant policy contract that bounds the
+// autonomy of one (or more) WorkflowSchedules: it can ALLOWLIST the
+// tools the schedule may use, BLOCKLIST specific actions or risk
+// levels, set a per-fire budget, and impose an expiry after which the
+// schedule stops firing.
+//
+// We deliberately keep the policy on a separate model rather than
+// folding the fields into WorkflowSchedule directly:
+//   - Schedules stay "dumb" (cron + goal + maxCostUsd) and reusable
+//   - A standing order can exist WITHOUT a schedule (e.g. tenant-wide
+//     "approval required for any external action ever") via
+//     `workflowScheduleId = null`
+//   - The model mirrors the `ScheduledAttestation` pattern already used
+//     for compliance: a contract that the scheduler enforces at fire time.
+//
+// Hard rules enforced at fire time (apps/api/src/services/scheduler.service.ts):
+//   - `expiresAt < now`: schedule does NOT fire (stale rows expire on
+//     fetch even if they haven't been disabled)
+//   - `budgetUsd`: takes precedence over WorkflowSchedule.maxCostUsd
+//     when LOWER (never raises the cap)
+//   - `allowedTools`: passed through to disabledToolNames inversion
+//     (whitelist → block-everything-else)
+//   - `blockedActions`: appended to disabledToolNames
+//   - `approvalRequiredFor`: forces tasks at these tool/risk levels
+//     through the approval gate even when auto-approve is on
+model StandingOrder {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  userId              String
+  /// Optional FK — null means the order applies globally to the tenant
+  /// (e.g. "approve nothing destructive ever"); a string FK means the
+  /// order is scoped to that one schedule's fires.
+  workflowScheduleId  String?
+  name                String
+  description         String?
+
+  /// Tool names the schedule MAY invoke. Empty = no whitelist (all tools
+  /// allowed except those in blockedActions). Non-empty = strict
+  /// whitelist (only listed tools allowed).
+  allowedTools        String[]  @default([])
+  /// Tool names the schedule MAY NOT invoke under any circumstance.
+  /// Wins over allowedTools when both list a tool.
+  blockedActions      String[]  @default([])
+  /// ToolRiskLevel / RiskLevel values that ALWAYS require human approval
+  /// regardless of the tenant's auto-approve setting. e.g. ["EXTERNAL_ACTION_APPROVAL",
+  /// "CRITICAL_MANUAL_ONLY"]. Empty = use the tenant's default threshold.
+  approvalRequiredFor String[]  @default([])
+  /// Optional source allowlist (e.g. for connector manifests that fan
+  /// out across providers). Empty = no source restriction.
+  allowedSources      String[]  @default([])
+  /// Per-fire USD budget. When set, overrides WorkflowSchedule.maxCostUsd
+  /// IF LOWER. Never raises the cap.
+  budgetUsd           Float?
+  /// Hard expiry. Once `now > expiresAt`, the schedule stops firing.
+  /// Independent of `enabled` so a stale order that someone forgot to
+  /// disable still expires honestly.
+  expiresAt           DateTime?
+  enabled             Boolean   @default(true)
+
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  tenant              Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflowSchedule    WorkflowSchedule? @relation(fields: [workflowScheduleId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, enabled])
+  @@index([workflowScheduleId])
+  @@index([expiresAt])
+  @@map("standing_orders")
+}
+
+// ─── Vibe Coding: Project Models ────────────────────────────────────────────
+
+model Project {
+  id              String    @id @default(cuid())
+  tenantId        String
+  userId          String
+  name            String
+  description     String?   @db.Text
+  framework       String    @default("nextjs") // nextjs | react-spa | react-native | fastify-api
+  status          String    @default("DRAFT")  // DRAFT | GENERATING | BUILDING | READY | DEPLOYED | FAILED
+  lastBuildError  String?   @db.Text           // FIX #17: Store last build error for debugging
+  sandboxId       String?
+  previewUrl      String?
+  deploymentUrl   String?
+  deploymentId    String?
+  githubRepo      String?
+  githubBranch    String?   @default("main")
+  templateId      String?
+  currentVersion  Int       @default(0)
+  totalCostUsd    Float     @default(0)
+  metadata        Json?     // architecture, config, env vars, etc.
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // FIX #16: Add proper User relation
+  tenant          Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user            User                @relation(fields: [userId], references: [id])
+  files           ProjectFile[]
+  versions        ProjectVersion[]
+  conversations   ProjectConversation[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, userId])
+  @@map("projects")
+}
+
+model ProjectFile {
+  id         String   @id @default(cuid())
+  projectId  String
+  path       String   // e.g. "src/app/page.tsx"
+  content    String   @db.Text
+  language   String?  // tsx, ts, css, json, md, etc.
+  size       Int      @default(0)
+  hash       String?  // SHA-256 for diffing
+  versionId  String?  // which version created/modified this
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // FIX #3: Removed isDeleted + soft-delete pattern.
+  // Files are hard-deleted; use ProjectVersion.snapshotJson for history/rollback.
+  @@unique([projectId, path])
+  @@index([projectId])
+  @@map("project_files")
+}
+
+model ProjectVersion {
+  id           String   @id @default(cuid())
+  projectId    String
+  version      Int
+  description  String?
+  snapshotJson Json?    // full file tree snapshot for rollback
+  diffJson     Json?    // files changed in this version
+  createdBy    String   @default("system") // "user" | "agent" | "system"
+  workflowId   String?  // optional link to the workflow that created this version
+  createdAt    DateTime @default(now())
+
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, version])
+  @@index([projectId])
+  @@map("project_versions")
+}
+
+model ProjectConversation {
+  id         String   @id @default(cuid())
+  projectId  String
+  role       String   // "user" | "assistant" | "system"
+  content    String   @db.Text
+  metadata   Json?    // file references, agent info, cost, etc.
+  workflowId String?
+  createdAt  DateTime @default(now())
+
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt])
+  @@map("project_conversations")
+}
+
+model UserLayout {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  layout    Json     // SerializedLayout from shell-store
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("user_layouts")
+}
+
+// ─── Built-in CRM Models ────────────────────────────────────────────────────
+
+model CrmContact {
+  id           String    @id @default(cuid())
+  tenantId     String
+  firstName    String
+  lastName     String
+  email        String
+  phone        String?
+  company      String?
+  title        String?
+  stage        String    @default("LEAD") // LEAD | QUALIFIED | OPPORTUNITY | CUSTOMER | CHURNED
+  tags         String[]  @default([])
+  assignedTo   String?
+  lastActivity DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  notes        CrmNote[]
+  deals        CrmDeal[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId, stage])
+  @@index([tenantId, company])
+  @@map("crm_contacts")
+}
+
+model CrmNote {
+  id         String   @id @default(cuid())
+  contactId  String
+  content    String   @db.Text
+  authorId   String
+  authorName String
+  createdAt  DateTime @default(now())
+
+  contact    CrmContact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([contactId])
+  @@map("crm_notes")
+}
+
+model CrmDeal {
+  id                String    @id @default(cuid())
+  tenantId          String
+  contactId         String
+  name              String
+  amount            Float     @default(0)
+  currency          String    @default("USD")
+  stage             String    @default("PROSPECT") // PROSPECT | NEGOTIATION | PROPOSAL | CLOSED_WON | CLOSED_LOST
+  probability       Float     @default(0)
+  expectedCloseDate DateTime?
+  assignedTo        String?
+  notes             String?   @db.Text
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  contact           CrmContact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, stage])
+  @@index([contactId])
+  @@map("crm_deals")
+}
+
+// ─── Managed AI: Subscriptions & Usage ──────────────────────────────────────
+
+model Subscription {
+  id              String    @id @default(cuid())
+  tenantId        String    @unique // One active subscription per tenant
+  planId          String    @default("free") // free | pro | team | enterprise | trial_30d
+  status          String    @default("active") // active | cancelled | past_due | trialing | trial_expired
+  creditsTotal    Int       @default(200)    // Monthly allocation
+  creditsUsed     Int       @default(0)      // Used this billing period
+  premiumTotal    Int       @default(0)      // Premium model (Tier 3) allocation
+  premiumUsed     Int       @default(0)
+  dailyUsed       Int       @default(0)      // Resets daily at midnight UTC
+  dailyCap        Int       @default(30)     // Max credits per day
+  perTaskCap      Int       @default(10)     // Max credits per single task
+  concurrentCap   Int       @default(1)      // Max concurrent workflows
+  maxModelTier    Int       @default(1)      // 1=cheap, 2=balanced, 3=premium
+  periodStart     DateTime  @default(now())
+  periodEnd       DateTime
+  dailyResetAt    DateTime  @default(now())
+  paddleSubId     String?   // Paddle subscription ID
+  paddleCustomerId String?  // Paddle customer ID
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // Migration 106 — Free 30-day trial (the landing-page CTA destination).
+  //
+  // We keep the existing dailyCap/dailyUsed (token-credits) and ADD three
+  // independent resource counters because each one fails differently and a
+  // bad-actor can drain only one:
+  //   - dailyAgentRunsUsed/Cap        : one workflow run = one count, regardless of step count
+  //   - dailyApprovalsUsed/Cap        : counts EXTERNAL_ACTION_APPROVAL or higher gates fired
+  //   - dailyToolMinutesUsed/Cap      : minutes of tool execution (browser, code-interp, etc.)
+  //
+  // trialStartedAt + trialEndsAt are nullable so non-trial tenants are
+  // identical to before. usage-counter.service.ts owns reset + increment.
+  trialStartedAt          DateTime?
+  trialEndsAt             DateTime?
+  dailyAgentRunsUsed      Int       @default(0)
+  dailyAgentRunsCap       Int       @default(20)
+  dailyApprovalsUsed      Int       @default(0)
+  dailyApprovalsCap       Int       @default(5)
+  dailyToolMinutesUsed    Int       @default(0)
+  dailyToolMinutesCap     Int       @default(120)
+  // dailyTokensUsed/Cap is a per-day version of creditsUsed/Total, expressed
+  // in raw input+output tokens so the cap doesn't depend on credit pricing.
+  dailyTokensUsed         Int       @default(0)
+  dailyTokensCap          Int       @default(200000)
+
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([paddleSubId])
+  @@index([trialEndsAt])
+  @@map("subscriptions")
+}
+
+model UsageLedger {
+  id              String   @id @default(cuid())
+  tenantId        String
+  userId          String
+  workflowId      String?
+  taskType        String   // chat, coding, analysis, research, etc.
+  modelUsed       String   // OpenAI model id used for the trace, e.g. gpt-5.4 / gpt-5.5.
+  provider        String   // openai, anthropic, google
+  inputTokens     Int      @default(0)
+  outputTokens    Int      @default(0)
+  creditsCost     Int      @default(0)    // Credits consumed
+  creditsReserved Int?                     // What was reserved pre-execution
+  usdCost         Float    @default(0)    // Actual $ cost to Jaak
+  latencyMs       Int?
+  status          String   @default("completed") // completed, failed, cancelled
+  createdAt       DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([userId, createdAt])
+  @@index([workflowId])
+  @@map("usage_ledger")
+}
+
+model RoutingLog {
+  id              String   @id @default(cuid())
+  taskType        String
+  selectedModel   String
+  selectedProvider String
+  fallbackUsed    Boolean  @default(false)
+  score           Float?
+  reason          String?
+  userPlan        String
+  inputTokens     Int?
+  createdAt       DateTime @default(now())
+
+  @@index([taskType, createdAt])
+  @@map("routing_log")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Audit & Compliance v1 — control framework mapping (e.g. SOC2 Type 2)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Three-table model:
+//   1. ComplianceFramework — the framework definition (e.g. "SOC2 Type 2").
+//      Global; not tenant-scoped. Seeded from packages/db/prisma/seed-data/
+//      compliance-frameworks.ts.
+//
+//   2. ComplianceControl — individual control within a framework
+//      (e.g. SOC2 CC6.1 "Logical Access Controls"). Many-to-one with
+//      Framework. Global; auto-mapping rules live in code, not DB.
+//
+//   3. ControlEvidenceMapping — tenant-scoped link between a control
+//      and a piece of evidence (an AuditLog row, a WorkflowArtifact,
+//      etc.). One control accumulates many evidence mappings over time.
+//      Auto-populated by the auto-mapping engine; can also be created
+//      manually via the API for human-curated mappings.
+//
+// ControlAttestation — a periodic snapshot saying "as of date X, this
+// tenant's control Y had N pieces of evidence covering period Z". The
+// attestation document itself is a WorkflowArtifact (artifactType=
+// 'control_attestation') signed via bundle-signing. This row is just
+// the summary record so the UI can list attestations without fetching
+// every artifact's bytes.
+
+model ComplianceFramework {
+  id          String   @id @default(cuid())
+  // Stable slug used in URLs + auto-mapping rule lookups (e.g. "soc2-type2").
+  slug        String   @unique
+  name        String   // "SOC 2 Type 2"
+  shortName   String   // "SOC 2"
+  // Issuing body (e.g. "AICPA", "ISO/IEC", "HHS").
+  issuer      String
+  // Free-text description shown on the framework selector page.
+  description String   @db.Text
+  // Catalogue version we're seeding from (e.g. "2017 TSC, revised 2022").
+  version     String
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  controls    ComplianceControl[]
+
+  @@map("compliance_frameworks")
+}
+
+model ComplianceControl {
+  id            String   @id @default(cuid())
+  frameworkId   String
+  // Stable code from the source standard (e.g. "CC6.1", "P1.1").
+  code          String
+  // Trust Services Category for SOC2 (e.g. "Security", "Privacy") or
+  // equivalent grouping for other frameworks.
+  category      String
+  // Common Criteria / Series identifier within the category (e.g. "CC6").
+  series        String
+  title         String
+  description   String   @db.Text
+  // Auto-mapping rule key — resolves to a function in the rule registry
+  // that decides which evidence rows belong to this control. Null when
+  // the control is human-mapped only (no automation).
+  autoRuleKey   String?
+  // Sub-control breakdown — JSON array of `{code, title, description}`.
+  // E.g. SOC 2 CC6.1 has 11 sub-points (CC6.1.1 ... CC6.1.11). NULL
+  // when the control has no published sub-points or the catalog hasn't
+  // seeded them yet. Auditors use these to write attestation narratives
+  // at sub-point granularity. The auto-mapping engine still maps
+  // evidence to the parent control today; sub-point routing is roadmap.
+  subControls   Json?
+  // Display order within its category.
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  framework     ComplianceFramework @relation(fields: [frameworkId], references: [id], onDelete: Cascade)
+  evidence      ControlEvidenceMapping[]
+
+  @@unique([frameworkId, code])
+  @@index([frameworkId, category, sortOrder])
+  @@map("compliance_controls")
+}
+
+model ControlEvidenceMapping {
+  id           String   @id @default(cuid())
+  tenantId     String
+  controlId    String
+  // What kind of row this mapping points at.
+  //   - 'audit_log'        → AuditLog.id
+  //   - 'workflow'         → Workflow.id
+  //   - 'approval'         → ApprovalRequest.id
+  //   - 'artifact'         → WorkflowArtifact.id
+  //   - 'evidence_bundle'  → WorkflowArtifact.id where artifactType='evidence_bundle'
+  evidenceType String
+  evidenceId   String
+  // When the underlying evidence was produced (denormalised so the
+  // attestation can do period queries without joining 4 tables).
+  evidenceAt   DateTime
+  // Who created the mapping. 'auto-mapper' for engine-created rows;
+  // user id for human curated rows.
+  mappedBy     String
+  // 'auto' = engine-created via autoRuleKey; 'manual' = human curated.
+  mappingSource String  @default("auto")
+  // Optional human note when mappingSource=manual.
+  notes        String?  @db.Text
+  createdAt    DateTime @default(now())
+
+  control      ComplianceControl @relation(fields: [controlId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, controlId, evidenceType, evidenceId])
+  @@index([tenantId, controlId, evidenceAt])
+  @@index([tenantId, evidenceAt])
+  @@map("control_evidence_mappings")
+}
+
+// Manual evidence — human-curated rows that supplement the auto-mapping
+// engine. Used for organisational policies, signed BAAs, vendor SOC
+// reports, training records, and other artefacts that no audit log
+// can produce.
+//
+// Each ManualEvidence row appears in the control's evidence drill-in
+// alongside auto-mapped rows; both count toward coverage. The auto-
+// mapper never deletes manual evidence — it only adds/upserts auto rows.
+model ManualEvidence {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  controlId           String
+  title               String
+  description         String    @db.Text
+  // Optional FK (soft — no cascade) to a WorkflowArtifact (e.g. an
+  // uploaded PDF policy). When set, the UI can deep-link to download.
+  attachedArtifactId  String?
+  createdBy           String
+  // For period-scoped attestations, the date the evidence is "valid as
+  // of". Defaults to createdAt when not supplied — operators can backdate
+  // to reflect when a policy actually went into effect.
+  evidenceAt          DateTime  @default(now())
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  // Soft-delete pattern matches WorkflowArtifact + TenantDocument.
+  deletedAt           DateTime?
+
+  @@index([tenantId, controlId, deletedAt])
+  @@index([tenantId, evidenceAt])
+  @@map("manual_evidence")
+}
+
+// ScheduledAttestation — cron-driven recurring attestation generation.
+//
+// Each row represents a single recurring schedule for a (tenant, framework)
+// pair. The AttestationScheduler service polls these rows every minute
+// and fires generation when `nextRunAt` has passed; afterwards it
+// computes the next occurrence from the cron expression and updates
+// the row.
+//
+// Period semantics: each fire produces an attestation covering the
+// `windowDays` days immediately preceding the firing time. So a
+// weekly schedule with windowDays=7 always covers the previous week.
+//
+// Honest gating: schedules require operator opt-in (active=true) AND
+// EVIDENCE_SIGNING_SECRET if signBundles=true. The scheduler skips
+// schedules whose dependencies aren't satisfied (logs + leaves
+// nextRunAt unchanged so a future tick retries).
+model ScheduledAttestation {
+  id              String    @id @default(cuid())
+  tenantId        String
+  frameworkId     String
+  // Standard 5-field cron expression in UTC (e.g. "0 0 * * 1" = every
+  // Monday midnight UTC). Validated at write time via cron-parser.
+  cronExpression  String
+  // How many days back from the firing time the attestation covers.
+  windowDays      Int       @default(7)
+  // When true, attempts to also create a signed evidence bundle alongside.
+  // Requires EVIDENCE_SIGNING_SECRET; failure to sign leaves the PDF
+  // attestation but logs a warning.
+  signBundles     Boolean   @default(false)
+  // Optional metadata stamped on every generated attestation
+  // (e.g. control framework variant, customer name).
+  metadata        Json?
+  // Operator opt-in — defaults to false; flipping to true starts firings
+  // on the next scheduler tick.
+  active          Boolean   @default(false)
+  // Computed by the scheduler from cronExpression at create + after
+  // every fire. NULL means "schedule paused" — never fired again until
+  // active flips back on.
+  nextRunAt       DateTime?
+  // Timestamp of the most recent successful fire (for the UI history table).
+  lastRunAt       DateTime?
+  // Last fire's outcome — "success" or "failed:<reason>" for the UI.
+  lastRunStatus   String?
+  // ID of the most recent attestation row produced by this schedule
+  // (lets the UI deep-link to the latest output).
+  lastAttestationId String?
+  createdBy       String
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([active, nextRunAt])
+  @@index([tenantId, frameworkId])
+  @@map("scheduled_attestations")
+}
+
+model ControlAttestation {
+  id              String   @id @default(cuid())
+  tenantId        String
+  frameworkId     String
+  // Period covered by this attestation.
+  periodStart     DateTime
+  periodEnd       DateTime
+  // Per-control evidence counts at attestation time, JSON-shaped:
+  //   [{ controlId, controlCode, evidenceCount }, ...]
+  controlSummary  Json
+  // Total evidence rows across all controls for this period.
+  totalEvidence   Int
+  // Coverage = controls with ≥1 evidence row in period / total controls.
+  coveragePercent Float
+  // The WorkflowArtifact that holds the signed PDF + JSON manifest.
+  // Null while the attestation is still generating; populated when ready.
+  artifactId      String?
+  generatedBy     String
+  createdAt       DateTime @default(now())
+
+  @@index([tenantId, frameworkId, createdAt])
+  @@map("control_attestations")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Audit & Compliance v2 — Audit Run product
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Distinct from generic Workflow + Compliance attestation systems. An
+// AuditRun represents a full audit engagement (e.g. "Q1 2026 SOC 2 Type 2
+// readiness check for Apex Health Network"). It owns ControlTest rows
+// (one per control in the framework), AuditException rows (created when a
+// test fails), and AuditWorkpaper rows (one per control with rich
+// narrative).
+//
+// State machine (audit-run-status enum stored as String):
+//   PLANNING       — created, awaiting plan() call
+//   PLANNED        — control tests seeded
+//   MAPPING        — auto-mapper running
+//   TESTING        — control tests running
+//   REVIEWING      — workpapers generated, awaiting reviewer
+//   READY_TO_PACK  — all workpapers approved
+//   FINAL_PACK     — final pack generated
+//   COMPLETED      — terminal: pack delivered
+//   FAILED         — terminal: error before pack
+//   CANCELLED      — terminal: operator cancelled
+
+model AuditRun {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  userId              String
+  // Stable framework slug (e.g. "soc2-type2") — soft FK to ComplianceFramework.slug
+  frameworkSlug       String
+  // Human-friendly title shown in the workspace (e.g. "Q1 2026 SOC 2 readiness")
+  title               String
+  // Optional scope description (e.g. "production cluster + customer support workflows")
+  scope               String?   @db.Text
+  // Period the audit covers
+  periodStart         DateTime
+  periodEnd           DateTime
+  // State machine
+  status              String    @default("PLANNING")
+  // Risk summary computed from test results: 'low' / 'medium' / 'high' / 'critical'
+  riskSummary         String?
+  // Computed coverage % across ControlTest rows (passed / total).
+  coveragePercent     Float?
+  // Set when status transitions to FINAL_PACK; points at the signed evidence bundle artifact
+  finalPackArtifactId String?
+  // Optional metadata (control framework variant, customer name, etc.)
+  metadata            Json?
+  // Soft-delete pattern matches WorkflowArtifact + TenantDocument
+  deletedAt           DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  controlTests        ControlTest[]
+  exceptions          AuditException[]
+  workpapers          AuditWorkpaper[]
+
+  @@index([tenantId, status, deletedAt])
+  @@index([tenantId, frameworkSlug])
+  @@index([tenantId, createdAt])
+  @@map("audit_runs")
+}
+
+// ControlTest — one row per (auditRun, control). Records the test
+// procedure, evidence considered, result, and any reviewer notes.
+//
+// Statuses: 'not_started' / 'evidence_missing' / 'evidence_received' /
+// 'testing' / 'passed' / 'failed' / 'exception_found' /
+// 'reviewer_required' / 'approved' / 'rejected' / 'remediated'
+//
+// Result: 'pass' / 'fail' / 'exception' / 'needs_evidence' (terminal)
+model ControlTest {
+  id              String    @id @default(cuid())
+  tenantId        String
+  auditRunId      String
+  // Soft FK to ComplianceControl.id — the control being tested
+  controlId       String
+  // Snapshot of the control code at test time (e.g. "CC6.1") so the
+  // workpaper survives if the catalog is reorganised
+  controlCode     String
+  controlTitle   String
+  // Test procedure narrative (LLM-generated or human-curated)
+  testProcedure   String?   @db.Text
+  // Per-test status (state machine — see comment above model)
+  status          String    @default("not_started")
+  // Terminal result (when status reaches a terminal state)
+  result          String?
+  // LLM rationale for the result
+  rationale       String?   @db.Text
+  // 0-1 confidence — when <0.7 the workpaper requires reviewer override
+  confidence      Float?
+  // Snapshot of evidence considered (audit_log/workflow/approval/artifact/manual_evidence ids)
+  evidenceConsidered Json?
+  evidenceCount   Int       @default(0)
+  // Set when result='fail' or 'exception' → AuditException row id
+  exceptionId     String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  auditRun        AuditRun  @relation(fields: [auditRunId], references: [id], onDelete: Cascade)
+
+  @@unique([auditRunId, controlId])
+  @@index([tenantId, auditRunId, status])
+  @@index([tenantId, controlId])
+  @@map("control_tests")
+}
+
+// AuditException — created when a ControlTest result is 'fail' or
+// 'exception'. Tracked through remediation lifecycle.
+//
+// Severity: 'low' / 'medium' / 'high' / 'critical' (from control's riskLevel)
+// Status: 'open' / 'remediation_planned' / 'remediation_in_progress' /
+// 'remediation_complete' / 'accepted' / 'rejected' / 'closed'
+model AuditException {
+  id              String    @id @default(cuid())
+  tenantId        String
+  auditRunId      String
+  controlTestId   String?
+  controlId       String
+  controlCode     String
+  severity        String    @default("medium")
+  // Description of the exception (LLM-synthesised or human)
+  description     String    @db.Text
+  // Root cause analysis
+  cause           String?   @db.Text
+  // Business impact narrative
+  impact          String?   @db.Text
+  // Remediation plan (suggested by AI or curated)
+  remediationPlan String?   @db.Text
+  remediationOwner String?
+  remediationDueDate DateTime?
+  status          String    @default("open")
+  // Reviewer decision when accepted/rejected
+  reviewerStatus  String?
+  reviewerComment String?   @db.Text
+  reviewedBy      String?
+  reviewedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  auditRun        AuditRun  @relation(fields: [auditRunId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, auditRunId, status])
+  @@index([tenantId, severity, status])
+  @@map("audit_exceptions")
+}
+
+// AuditWorkpaper — per-control narrative pulling together control,
+// tests, evidence, exceptions, reviewer notes. Generated as a real PDF
+// via existing exportPdf() and persisted as a WorkflowArtifact with
+// artifactType='workpaper' + approvalState='REQUIRES_APPROVAL'.
+//
+// Status: 'draft' / 'needs_evidence' / 'needs_review' / 'rejected' /
+// 'approved' / 'final'
+model AuditWorkpaper {
+  id              String    @id @default(cuid())
+  tenantId        String
+  auditRunId      String
+  controlTestId   String?
+  controlId       String
+  controlCode     String
+  controlTitle    String
+  // The PDF artifact id (FK to workflow_artifacts via app code; no schema FK
+  // because WorkflowArtifact has its own approval gate flow)
+  artifactId      String?
+  // Status (mirrors WorkflowArtifact.approvalState semantics; 'final' set
+  // once included in a final pack)
+  status          String    @default("draft")
+  // Reviewer narrative override (when reviewer edits the LLM-generated text)
+  reviewerNotes   String?   @db.Text
+  generatedBy     String
+  reviewedBy      String?
+  approvedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  auditRun        AuditRun  @relation(fields: [auditRunId], references: [id], onDelete: Cascade)
+
+  @@unique([auditRunId, controlId])
+  @@index([tenantId, auditRunId, status])
+  @@map("audit_workpapers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Migration 16 — Company Brain + Intent vocabulary + Workflow templates
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Adds the four primitives the layman-friendly company OS needs:
+//   1. CompanyProfile  — name/industry/brand voice/audience/competitors/etc.
+//   2. IntentRecord    — persisted intent classification per workflow
+//   3. WorkflowTemplate— pre-tuned best-practice decompositions per intent
+//   4. CompanyKnowledgeSource — URLs the user wants ingested (separate from
+//                              uploaded TenantDocuments)
+//
+// All additive — no changes to existing models. Approval gates enforced at
+// the service layer via the `status` field.
+
+// CompanyProfile — one row per tenant (logical singleton).
+//
+// Status:
+//   - 'extracted'    : LLM extracted from uploaded docs/URLs; awaits user review
+//   - 'user_approved': user reviewed + confirmed; agents may load this profile
+//                     into their system prompt for grounding
+//   - 'manual'       : user typed everything by hand, no extraction
+//
+// The agent-grounding layer ONLY loads profiles where status='user_approved'
+// or status='manual'. Extracted-but-unapproved profiles are visible to the
+// user for review but NOT used by agents until approved. No silent
+// overwrite — the user must explicitly approve.
+model CompanyProfile {
+  id                  String    @id @default(cuid())
+  tenantId            String    @unique
+  name                String?
+  industry            String?
+  description         String?   @db.Text
+  productsServices    Json?     // Array of {name, description}
+  targetCustomers     String?   @db.Text
+  brandVoice          String?   @db.Text  // e.g. "professional, warm, jargon-light"
+  competitors         Json?     // Array of {name, url?, notes?}
+  pricing             String?   @db.Text
+  websiteUrl          String?
+  goals               String?   @db.Text
+  constraints         String?   @db.Text
+  preferredChannels   Json?     // ['email', 'slack', 'whatsapp']
+  status              String    @default("extracted")
+  // Confidence per LLM extraction (0-1). Null when status='manual'.
+  extractionConfidence Float?
+  // Source documents the extraction was based on (TenantDocument ids)
+  sourceDocumentIds   Json?
+  reviewedBy          String?
+  reviewedAt          DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  tenant              Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("company_profiles")
+}
+
+// CompanyKnowledgeSource — URLs the user wants ingested into the Brain.
+// Separate from TenantDocument because this is for ongoing tracking
+// (monitor a competitor's pricing page, watch for changes, etc.).
+model CompanyKnowledgeSource {
+  id          String    @id @default(cuid())
+  tenantId    String
+  url         String
+  kind        String    // 'website' | 'competitor' | 'pricing' | 'product' | 'blog' | 'other'
+  title       String?
+  // Last successful crawl
+  lastCrawledAt DateTime?
+  // Status of last crawl: 'pending' | 'crawled' | 'failed'
+  lastCrawlStatus String  @default("pending")
+  lastCrawlError String?  @db.Text
+  // Vector document ids produced from the crawl (so we can re-ingest)
+  vectorDocumentIds Json?
+  createdBy   String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([tenantId, url])
+  @@index([tenantId, kind, deletedAt])
+  @@map("company_knowledge_sources")
+}
+
+// CompanyArtifact — one raw piece of company evidence ingested from a
+// connector or uploaded source. This is the YC "company legible to AI"
+// primitive: Slack threads, GitHub PRs/commits, Linear/Jira tickets,
+// Notion docs, meeting transcripts, customer calls, support tickets, etc.
+//
+// Raw text stays tenant-scoped and source-linked; downstream entities cite
+// artifacts instead of making unsupported claims.
+model CompanyArtifact {
+  id              String    @id @default(cuid())
+  tenantId        String
+  sourceType      String    // 'github' | 'linear' | 'slack' | 'notion' | 'meeting' | 'document' | 'customer' | ...
+  artifactType    String    // 'ticket' | 'pr' | 'commit' | 'meeting_transcript' | 'customer_feedback' | ...
+  externalId      String?
+  sourceUrl       String?
+  title           String
+  body            String    @db.Text
+  bodyHash        String
+  authorName      String?
+  occurredAt      DateTime?
+  metadata        Json?
+  ingestionStatus String    @default("ingested") // 'ingested' | 'extracted' | 'failed'
+  extractedAt     DateTime?
+  createdBy       String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  primaryEntities CompanyGraphEntity[] @relation("CompanyEntityPrimaryArtifact")
+
+  @@unique([tenantId, sourceType, externalId])
+  @@index([tenantId, sourceType, artifactType, occurredAt])
+  @@index([tenantId, deletedAt, createdAt])
+  @@map("company_artifacts")
+}
+
+// CompanyGraphEntity — normalized company knowledge extracted from raw
+// artifacts. These are the nouns the closed loop reasons over: decisions,
+// tasks, specs, customer signals, risks, owners, code changes, deadlines.
+model CompanyGraphEntity {
+  id                String    @id @default(cuid())
+  tenantId          String
+  primaryArtifactId String?
+  entityType        String    // 'decision' | 'task' | 'spec' | 'customer_signal' | 'code_change' | 'risk' | ...
+  title             String
+  summary           String    @db.Text
+  status            String    @default("active")
+  ownerName         String?
+  priority          String?   // 'low' | 'medium' | 'high' | 'critical'
+  confidence        Float     @default(0.5)
+  occurredAt        DateTime?
+  dueAt             DateTime?
+  sourceArtifactIds Json      // string[]
+  relatedEntityIds  Json?
+  properties        Json?
+  extractedBy       String    @default("openai")
+  createdBy         String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  primaryArtifact   CompanyArtifact? @relation("CompanyEntityPrimaryArtifact", fields: [primaryArtifactId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, entityType, status, updatedAt])
+  @@index([tenantId, ownerName])
+  @@index([tenantId, priority])
+  @@map("company_graph_entities")
+}
+
+// ExecutionDriftFinding — deterministic closed-loop finding produced by
+// comparing company intent/customer signal against execution evidence.
+// Examples:
+//   - customer pain has no task/spec/code tied to it
+//   - founder decision never became execution work
+//   - engineering work has no visible customer/founder rationale
+model ExecutionDriftFinding {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  fingerprint         String
+  driftType           String
+  severity            String    // 'low' | 'medium' | 'high' | 'critical'
+  status              String    @default("open") // 'open' | 'acknowledged' | 'resolved' | 'dismissed'
+  title               String
+  summary             String    @db.Text
+  recommendation      String    @db.Text
+  evidenceArtifactIds Json
+  evidenceEntityIds   Json
+  confidence          Float     @default(0.7)
+  detectedAt          DateTime  @default(now())
+  resolvedAt          DateTime?
+  metadata            Json?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  tenant              Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  specs               AgentExecutableSpec[]
+
+  @@unique([tenantId, fingerprint])
+  @@index([tenantId, status, severity, detectedAt])
+  @@index([tenantId, driftType])
+  @@map("execution_drift_findings")
+}
+
+// AgentExecutableSpec — a reviewed handoff packet agents can execute:
+// PRD/technical plan, acceptance criteria, test plan, agent task plan,
+// approval gates, and evidence links.
+model AgentExecutableSpec {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  driftFindingId      String?
+  title               String
+  problemStatement    String    @db.Text
+  objective           String    @db.Text
+  contextSummary      String    @db.Text
+  proposedApproach    String    @db.Text
+  acceptanceCriteria  Json
+  testPlan            Json
+  agentTaskPlan       Json
+  approvalGates       Json
+  evidenceArtifactIds Json
+  evidenceEntityIds   Json
+  status              String    @default("draft") // 'draft' | 'approved' | 'rejected'
+  generatedBy         String    @default("openai")
+  reviewedBy          String?
+  reviewedAt          DateTime?
+  reviewComment       String?   @db.Text
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  deletedAt           DateTime?
+
+  tenant              Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  driftFinding        ExecutionDriftFinding? @relation(fields: [driftFindingId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, driftFindingId])
+  @@map("agent_executable_specs")
+}
+
+// CompanyConnectorSyncState — per-tenant sync cursor + health state for
+// provider ingestion into CompanyArtifact. Provider is canonicalized to
+// GITHUB | GMAIL | GOOGLE_DRIVE regardless of source alias (e.g. DRIVE).
+model CompanyConnectorSyncState {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  provider            String
+  integrationProvider String?
+  status              String    @default("not_connected") // not_connected | idle | running | error | disabled
+  cursorJson          Json?
+  lastSyncedAt        DateTime?
+  lastSuccessAt       DateTime?
+  lastError           String?   @db.Text
+  lastErrorAt         DateTime?
+  consecutiveFailures Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  tenant              Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  runs                CompanyConnectorSyncRun[]
+
+  @@unique([tenantId, provider])
+  @@index([tenantId, status, updatedAt])
+  @@map("company_connector_sync_states")
+}
+
+// CompanyConnectorSyncRun — append-only execution history for sync jobs.
+// Lets operators inspect scheduled/manual runs, counts, and errors.
+model CompanyConnectorSyncRun {
+  id              String    @id @default(cuid())
+  syncStateId     String?
+  tenantId        String
+  provider        String
+  trigger         String    @default("scheduled") // scheduled | manual | bootstrap
+  status          String    @default("running") // running | success | partial | failed
+  startedAt       DateTime  @default(now())
+  completedAt     DateTime?
+  durationMs      Int?
+  fetchedCount    Int       @default(0)
+  ingestedCount   Int       @default(0)
+  skippedCount    Int       @default(0)
+  errorMessage    String?   @db.Text
+  cursorBeforeJson Json?
+  cursorAfterJson Json?
+  metadata        Json?
+  createdAt       DateTime  @default(now())
+
+  syncState       CompanyConnectorSyncState? @relation(fields: [syncStateId], references: [id], onDelete: SetNull)
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, provider, startedAt])
+  @@index([tenantId, status, startedAt])
+  @@index([syncStateId, startedAt])
+  @@map("company_connector_sync_runs")
+}
+
+// IntentRecord — persists the Commander's intent classification per
+// workflow run, so we have a queryable history (analytics, future
+// follow-up routing, audit trail).
+//
+// The `intent` field is constrained at the application layer to one of
+// the 18 named values defined in COMPANY_OS_INTENTS (packages/agents/
+// src/intents/intent-vocabulary.ts).
+model IntentRecord {
+  id                String    @id @default(cuid())
+  tenantId          String
+  workflowId        String?   // null when Commander short-circuits with directAnswer
+  userId            String
+  rawInput          String    @db.Text
+  intent            String    // one of the 18 named intents
+  intentConfidence  Float?    // 0-1, LLM-self-reported
+  subFunction       String?
+  urgency           Int?      // 1-5
+  riskIndicators    Json?     // String[]
+  requiredOutputs   Json?     // String[]
+  workflowTemplateId String?  // FK to WorkflowTemplate.id when matched
+  clarificationNeeded Boolean @default(false)
+  clarificationQuestion String? @db.Text
+  directAnswer      String?   @db.Text  // when Commander short-circuited
+  createdAt         DateTime  @default(now())
+
+  @@index([tenantId, intent, createdAt])
+  @@index([tenantId, workflowId])
+  @@index([tenantId, userId, createdAt])
+  @@map("intent_records")
+}
+
+// WorkflowTemplate — pre-tuned best-practice workflow specifications,
+// matched to user intents. The Commander/Planner can look up a template
+// by intent and use its tuned decomposition instead of asking the LLM
+// to re-derive it from scratch.
+//
+// status: 'active' | 'inactive' | 'experimental'
+model WorkflowTemplate {
+  id              String    @id @default(cuid())
+  // Per-tenant overrides allowed. tenantId=null means a system template
+  // available to all tenants (the seeded library).
+  tenantId        String?
+  intent          String    // one of the 18 named intents
+  name            String
+  description     String    @db.Text
+  // The tasks the Planner should produce. Array of {id, name, agentRole,
+  // toolsRequired, dependsOn, riskLevel, requiresApproval, retryable}.
+  tasksJson       Json
+  // Required company-context fields (e.g. ['brandVoice', 'targetCustomers'])
+  // The Commander surfaces "missing inputs" when these aren't on the tenant's
+  // CompanyProfile.
+  requiredCompanyContext Json?
+  // Required user inputs (e.g. ['websiteUrl', 'audience'])
+  requiredUserInputs Json?
+  // Approval gates — array of step ids that need approval before continuing.
+  approvalGates   Json?
+  // Expected artifact types (e.g. ['report.pdf', 'campaign.json'])
+  expectedArtifacts Json?
+  status          String    @default("active")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([tenantId, intent, name])
+  @@index([intent, status])
+  @@map("workflow_templates")
+}
+
+// WorkflowCheckpoint — Sprint 2.5 / A.2.
+//
+// Stores LangGraph checkpoint snapshots and pending writes for the new
+// PostgresCheckpointSaver. Replaces the previous Workflow.stateJson
+// storage when LangGraph is the active runtime.
+//
+// Tenant isolation is enforced at every read via composite (tenantId,
+// threadId) WHERE clauses in PostgresCheckpointSaver. Cross-tenant
+// access attempts return undefined as if the checkpoint did not exist.
+//
+// Two row types share the table:
+//   - type='checkpoint' rows hold a full state snapshot (Checkpoint +
+//     metadata + channelVersions). Uniqueness is on
+//     (threadId, checkpointNs, checkpointId).
+//   - type='write' rows hold pending per-task writes that have not yet
+//     been folded into a checkpoint. Multiple writes can share a
+//     parent checkpoint, so they have no uniqueness constraint.
+// ─── External auditor portal (Sprint 2.6) ───────────────────────────────
+//
+// Invite-token-only auth for third-party auditors. One invite creates
+// one engagement (a per-audit-run access grant). Every auditor action
+// is logged for audit-trail purposes.
+
+model ExternalAuditorInvite {
+  id              String    @id @default(cuid())
+  tenantId        String    @map("tenant_id")
+  auditRunId      String    @map("audit_run_id")
+  auditorEmail    String    @map("auditor_email")
+  auditorName     String?   @map("auditor_name")
+  // SHA-256 hex of the cleartext token. Cleartext is returned ONCE on
+  // creation; the system NEVER stores raw tokens.
+  tokenHash       String    @unique @map("token_hash")
+  scopes          String[]
+  status          String    @default("PENDING")  // PENDING | ACCEPTED | REVOKED | EXPIRED
+  createdBy       String    @map("created_by")
+  expiresAt       DateTime  @map("expires_at")
+  acceptedAt      DateTime? @map("accepted_at")
+  acceptedUserId  String?   @map("accepted_user_id")
+  revokedAt       DateTime? @map("revoked_at")
+  revokedBy       String?   @map("revoked_by")
+  // Final hardening / Gap C — invite email send tracking.
+  emailStatus     String?   @map("email_status")  // pending | sent | not_configured | failed
+  emailSentAt     DateTime? @map("email_sent_at")
+  emailError      String?   @map("email_error")
+  emailProvider   String?   @map("email_provider")  // 'smtp' when configured
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@index([tenantId, status], map: "external_auditor_invites_tenant_status_idx")
+  @@index([auditRunId], map: "external_auditor_invites_audit_run_idx")
+  @@map("external_auditor_invites")
+}
+
+model ExternalAuditorEngagement {
+  id                String    @id @default(cuid())
+  tenantId          String    @map("tenant_id")
+  userId            String    @map("user_id")
+  auditorEmail      String    @map("auditor_email")
+  auditRunId        String    @map("audit_run_id")
+  inviteId          String    @map("invite_id")
+  scopes            String[]
+  accessGrantedAt   DateTime  @default(now()) @map("access_granted_at")
+  accessRevokedAt   DateTime? @map("access_revoked_at")
+  expiresAt         DateTime  @map("expires_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  @@unique([userId, auditRunId], map: "external_auditor_engagements_user_run_key")
+  @@index([tenantId, userId], map: "external_auditor_engagements_tenant_user_idx")
+  @@index([auditRunId], map: "external_auditor_engagements_audit_run_idx")
+  @@map("external_auditor_engagements")
+}
+
+model ExternalAuditorAction {
+  id            String    @id @default(cuid())
+  tenantId      String    @map("tenant_id")
+  userId        String    @map("user_id")
+  auditorEmail  String    @map("auditor_email")
+  auditRunId    String    @map("audit_run_id")
+  engagementId  String    @map("engagement_id")
+  objectType    String    @map("object_type")  // workpaper | evidence | control | final_pack | engagement
+  objectId      String?   @map("object_id")
+  action        String                            // view | comment | approve | reject | request_changes | download
+  comment       String?
+  metadata      Json?
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@index([tenantId, auditRunId], map: "external_auditor_actions_tenant_run_idx")
+  @@index([engagementId, createdAt(sort: Desc)], map: "external_auditor_actions_engagement_idx")
+  @@index([userId, createdAt(sort: Desc)], map: "external_auditor_actions_user_idx")
+  @@map("external_auditor_actions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Migration 106 — Team + Trial models
+//
+// `Department`      : org-chart unit (HR, Engineering, Marketing, ...).
+// `TaskAssignment`  : a workflow step routed to a HUMAN (vs an AI agent).
+// `Notification`    : per-user inbox notifications (assignments, mentions).
+// `TrialSignup`     : landing-page free-trial intake — captures email +
+//                     intent BEFORE the tenant is fully created. The trial
+//                     route promotes a TrialSignup row into a real Tenant
+//                     once the user verifies their email.
+//
+// Design notes:
+//   - All four tables are tenant-scoped except TrialSignup (which IS the
+//     pre-tenant signup record).
+//   - TaskAssignment carries `workflowId` + `taskId` (taskId references the
+//     in-state task identifier from `Workflow.stateJson`) so we can render
+//     "what's waiting on me" without pulling the whole workflow JSON.
+//   - We deliberately do NOT chain-hash these rows — they ride the existing
+//     AuditLog + signed-bundle infrastructure for tamper-evidence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Department {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  // Self-FK lets us model nested orgs (Engineering > Backend > Auth).
+  // Optional; a top-level department has no parent.
+  parentId    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant   Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  parent   Department?  @relation("DepartmentParent", fields: [parentId], references: [id], onDelete: SetNull)
+  children Department[] @relation("DepartmentParent")
+  members  User[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, parentId])
+  @@map("departments")
+}
+
+model TaskAssignment {
+  id            String    @id @default(cuid())
+  tenantId      String
+  workflowId    String
+  // Identifier of the task within the workflow's planJson/stateJson. We do
+  // not FK to Workflow on this column because tasks live in JSON; tenantId
+  // + workflowId scoping is the integrity guarantee.
+  taskId        String
+  // The user the task is assigned to. Required — there's no point creating
+  // an unassigned TaskAssignment row (use the in-state task itself).
+  assigneeUserId String
+  // Who created the assignment (CEO, manager, or the planner agent itself
+  // when an org-chart-aware planner routes a step to a human).
+  assignedByUserId String
+  // Free-form copy of the task description so the assignee doesn't need to
+  // open the workflow to understand what's being asked.
+  title         String
+  instructions  String?  @db.Text
+  // Lifecycle:
+  //   PENDING      — assigned, not yet acknowledged
+  //   ACKNOWLEDGED — assignee opened it, hasn't completed
+  //   COMPLETED    — done; output may be in `resultJson`
+  //   DECLINED     — assignee refused (with reason in `resultJson.reason`)
+  //   CANCELLED    — assigner withdrew
+  //   EXPIRED      — `dueAt` passed without action (background job sweeps)
+  status        String    @default("PENDING")
+  // Risk lattice (matches ToolRiskLevel) so the inbox can show a badge and
+  // sort by urgency. Optional — many human tasks are LOW.
+  riskLevel     String    @default("MEDIUM")
+  dueAt         DateTime?
+  acknowledgedAt DateTime?
+  completedAt   DateTime?
+  // Result captured when the human completes — could be free-form text,
+  // a decision, an attachment reference, anything the next agent step needs.
+  resultJson    Json?
+  // Free-form metadata for the producer (e.g. workflow step number).
+  metadata      Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  tenant      Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assignee    User   @relation("TaskAssignmentAssignee", fields: [assigneeUserId], references: [id], onDelete: Cascade)
+  // P0-1 (audit 2026-05-08): explicit `onDelete: NoAction` matches the
+  // live DB constraint (migration 106 line 94). NoAction is intentional —
+  // we want to PREVENT user-deletion when there are still TaskAssignments
+  // attributing actions to them, so the audit trail can never be orphaned.
+  assignedBy  User   @relation("TaskAssignmentAssigner", fields: [assignedByUserId], references: [id], onDelete: NoAction)
+
+  @@index([tenantId, assigneeUserId, status])
+  @@index([tenantId, workflowId])
+  @@index([status, dueAt])
+  @@map("task_assignments")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  // Open vocabulary so we can add new kinds without migrations:
+  //   'task_assigned' | 'task_due_soon' | 'task_completed' | 'mention'
+  //   | 'approval_needed' | 'approval_decided' | 'trial_cap_hit'
+  //   | 'trial_ending'  | 'workflow_completed'
+  kind      String
+  title     String
+  body      String?  @db.Text
+  // Optional deep-link target so the inbox row can route the user with one click.
+  linkPath  String?
+  // Extra payload for renderers (workflowId, taskAssignmentId, etc.)
+  payload   Json?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, userId, readAt])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+model TrialSignup {
+  id              String    @id @default(cuid())
+  // Captured BEFORE the tenant exists — we promote into a real Tenant once
+  // the user verifies their email AND creates a workspace. tenantId becomes
+  // non-null on promotion.
+  email           String    @unique
+  // Fingerprint to slow down trial-cycling (one trial per email + one per IP
+  // per 90 days at the application layer).
+  fingerprint     String?
+  // Marketing source for funnel analysis.
+  source          String?   // 'landing' | 'jak-shield-section' | 'partner-link' | ...
+  // Form fields collected on landing — all optional.
+  companyName     String?
+  industry        String?
+  teamSize        String?   // '1' | '2-5' | '6-20' | '21-100' | '100+'
+  // Lifecycle:
+  //   PENDING_VERIFY — email sent, awaiting click
+  //   VERIFIED       — clicked, awaiting workspace bootstrap
+  //   PROMOTED       — Tenant created; tenantId points at it
+  //   EXPIRED        — verification link timed out (24h)
+  //   ABANDONED      — verified but never bootstrapped (7d)
+  status          String    @default("PENDING_VERIFY")
+  // 32-byte URL-safe token. Stored as SHA-256 hash (never cleartext).
+  verifyTokenHash String    @unique
+  verifyExpiresAt DateTime
+  verifiedAt      DateTime?
+  promotedAt      DateTime?
+  tenantId        String?   @unique
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // Optional FK only after promotion. SetNull on tenant delete so the signup
+  // history survives a tenant being purged for any reason.
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([fingerprint])
+  @@map("trial_signups")
+}
+
+model WorkflowCheckpoint {
+  id                  String    @id @default(cuid())
+  threadId            String    @map("thread_id")
+  checkpointNs        String    @default("") @map("checkpoint_ns")
+  checkpointId        String    @map("checkpoint_id")
+  parentCheckpointId  String?   @map("parent_checkpoint_id")
+  tenantId            String    @map("tenant_id")
+  type                String    // 'checkpoint' | 'write'
+  checkpointJson      Json?     @map("checkpoint_json")
+  metadataJson        Json?     @map("metadata_json")
+  channelVersionsJson Json?     @map("channel_versions_json")
+  taskId              String?   @map("task_id")
+  writesJson          Json?     @map("writes_json")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  @@index([tenantId, threadId, createdAt(sort: Desc)], map: "workflow_checkpoints_tenant_thread_created_idx")
+  @@index([threadId, parentCheckpointId], map: "workflow_checkpoints_thread_parent_idx")
+  @@index([type, threadId], map: "workflow_checkpoints_type_thread_idx")
+  @@map("workflow_checkpoints")
+}

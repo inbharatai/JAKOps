@@ -1,0 +1,71 @@
+# ─── JAK Swarm Worker — Cloud Build + Cloud Run ──────────────────────────────
+#
+# Build the Worker Docker image and deploy to Cloud Run.
+#
+# The worker is a long-running PostgreSQL queue processor with an HTTP metrics server.
+# It MUST stay running (min-instances=1, cpu-always-allocated) because it polls
+# the database with FOR UPDATE SKIP LOCKED and subscribes to Redis for workflow signals.
+# Do NOT scale this to zero — background processing would stop entirely.
+#
+# Prerequisites:
+#   1. gcloud CLI installed and authenticated
+#   2. Artifact Registry repo created (see docs/GOOGLE_SECRET_MANAGER_SETUP.md)
+#   3. Secret Manager secrets created (see scripts/create-gcp-secrets.sh)
+#   4. Service account with roles/run.admin, roles/secretmanager.secretAccessor
+#
+# Usage:
+#   gcloud builds submit --config=cloudbuild-worker.yaml \
+#     --substitutions=_REGION=asia-south1,_SERVICE_NAME=jak-swarm-worker,_REPO_NAME=jak-docker,_IMAGE_TAG=manual-20260608 \
+#     --project=crafty-haiku-498807-v8
+
+steps:
+  # ─── Step 1: Build the Docker image ───────────────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.worker'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:${_IMAGE_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:latest'
+      - '.'
+
+  # ─── Step 2: Push images to Artifact Registry ─────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}']
+
+  # ─── Step 3: Deploy to Cloud Run ──────────────────────────────────────────
+  # The Worker listens on port 9464 (WORKER_METRICS_PORT) for health/metrics.
+  # It does NOT need public access (--no-allow-unauthenticated).
+  # CPU is always allocated because the worker continuously polls the database.
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud run deploy ${_SERVICE_NAME} \
+          --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:${_IMAGE_TAG} \
+          --region=${_REGION} \
+          --platform=managed \
+          --port=9464 \
+          --memory=1Gi \
+          --cpu=1 \
+          --min-instances=1 \
+          --max-instances=5 \
+          --cpu-allocated-always \
+          --timeout=300 \
+          --service-account=jak-cloud-run-sa@crafty-haiku-498807-v8.iam.gserviceaccount.com \
+          --no-allow-unauthenticated \
+          --set-secrets="DATABASE_URL=DATABASE_URL:latest,AUTH_SECRET=AUTH_SECRET:latest,OPENAI_API_KEY=OPENAI_API_KEY:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,REDIS_URL=REDIS_URL:latest,DIRECT_URL=DIRECT_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SERVICE_ROLE_KEY:latest,EVIDENCE_SIGNING_SECRET=EVIDENCE_SIGNING_SECRET:latest,METRICS_TOKEN=METRICS_TOKEN:latest" \
+          --set-env-vars="NODE_ENV=production,WORKFLOW_WORKER_MODE=standalone,REQUIRE_REDIS_IN_PROD=true,WORKER_METRICS_PORT=9464,LLM_PROVIDER=gemini,JAK_ADK_MODE=1,GEMINI_GOOGLE_SEARCH_GROUNDING=1,OPENAI_WEB_SEARCH=1"
+
+substitutions:
+  _REGION: asia-south1
+  _SERVICE_NAME: jak-swarm-worker
+  _REPO_NAME: jak-docker
+  _IMAGE_TAG: latest
+
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:${_IMAGE_TAG}'
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:latest'

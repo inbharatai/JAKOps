@@ -1,0 +1,296 @@
+// Base
+export { AgentContext } from './base/agent-context.js';
+export type { AgentActivityEvent, AgentActivityEmitter } from './base/agent-context.js';
+export type { AgentContextParams } from './base/agent-context.js';
+export { BaseAgent, extractFirstJsonBlob } from './base/base-agent.js';
+export type { ToolLoopResult, MemoryProvider, CompanyContextProvider, ReflectionMode, ReflectAndCorrectOptions } from './base/base-agent.js';
+
+// Multi-agent coordination (Sprint 3 — full-fledged JAK)
+export {
+  decomposeGoal,
+  summarizePlan,
+} from './coordination/subgoal-coordinator.js';
+export type { Subgoal, SubgoalCoordinatorResult } from './coordination/subgoal-coordinator.js';
+
+// LLM Providers
+export type { LLMProvider, LLMResponse, TextContent, ImageContent, MessageContent } from './base/llm-provider.js';
+export { OpenAIProvider } from './base/providers/openai-provider.js';
+export { GeminiProvider } from './base/providers/gemini-provider.js';
+export { ProviderRouter, getDefaultProvider, getProviderForTier } from './base/provider-router.js';
+export type { ProviderHints as ProviderRouterHints } from './base/provider-router.js';
+
+// Anti-hallucination & optimization utilities
+export {
+  fullHallucinationCheck,
+  detectInventedStatistics,
+  detectFabricatedSources,
+  detectOverconfidence,
+  detectImpossibleClaims,
+  groundingCheck,
+} from './base/anti-hallucination.js';
+
+export {
+  estimateTokens,
+  compressContext,
+  selectModel,
+} from './base/token-optimizer.js';
+
+// Orchestrator agents
+export { CommanderAgent, inferIntentFromKeywords, buildHelpfulClarification } from './roles/commander.agent.js';
+export type { MissionBrief, CommanderOutput } from './roles/commander.agent.js';
+
+// Intent vocabulary — canonical 18 named intents for the company OS.
+export {
+  COMPANY_OS_INTENTS,
+  CompanyOSIntentSchema,
+  INTENT_DESCRIPTIONS,
+  INTENT_TO_LIKELY_AGENTS,
+  INTENT_REQUIRED_CONTEXT,
+} from './intents/intent-vocabulary.js';
+export type { CompanyOSIntent } from './intents/intent-vocabulary.js';
+
+export { PlannerAgent } from './roles/planner.agent.js';
+export type { PlannerOutput } from './roles/planner.agent.js';
+
+export { RouterAgent } from './roles/router.agent.js';
+export type { RouteMap, RouterOutput } from './roles/router.agent.js';
+
+export { VerifierAgent } from './roles/verifier.agent.js';
+export type { VerificationResult, VerifierInput } from './roles/verifier.agent.js';
+
+export { GuardrailAgent } from './roles/guardrail.agent.js';
+export type { GuardrailResult, GuardrailInput } from './roles/guardrail.agent.js';
+
+export { ApprovalAgent } from './roles/approval.agent.js';
+export type { ApprovalInput } from './roles/approval.agent.js';
+
+// Worker agents
+export { EmailAgent } from './workers/email.agent.js';
+export type {
+  EmailAction,
+  EmailTask,
+  EmailMessage,
+  EmailResult,
+  EmailFilter,
+  EmailDeliverability,
+  EmailABVariant,
+} from './workers/email.agent.js';
+
+export { DocumentAgent } from './workers/document.agent.js';
+export type {
+  DocumentAction,
+  DocumentTask,
+  DocumentResult,
+  ExtractionField,
+} from './workers/document.agent.js';
+
+export { ResearchAgent } from './workers/research.agent.js';
+export type {
+  ResearchTask,
+  ResearchResult,
+  ResearchSource,
+  ResearchDisagreement,
+} from './workers/research.agent.js';
+
+export { BrowserAgent } from './workers/browser.agent.js';
+export type {
+  BrowserAction,
+  BrowserTask,
+  BrowserResult,
+} from './workers/browser.agent.js';
+
+export { SupportAgent } from './workers/support.agent.js';
+export type {
+  SupportAction,
+  SupportTask,
+  SupportResult,
+  SupportClassification,
+  SupportCategory,
+  SupportSentiment,
+} from './workers/support.agent.js';
+
+export { CalendarAgent } from './workers/calendar.agent.js';
+export type {
+  CalendarTask,
+  CalendarResult,
+  CalendarEvent,
+  AvailabilitySlot,
+  SchedulingConflict,
+  SlotRationale,
+  MeetingType,
+} from './workers/calendar.agent.js';
+
+export { CRMAgent } from './workers/crm.agent.js';
+export type {
+  CRMTask,
+  CRMResult,
+  CRMContact,
+  CRMDeal,
+  CRMNote,
+  DealHealth,
+  LeadQualification,
+} from './workers/crm.agent.js';
+
+export { SpreadsheetAgent } from './workers/spreadsheet.agent.js';
+export type { SpreadsheetTask, SpreadsheetResult } from './workers/spreadsheet.agent.js';
+
+export { OpsAgent } from './workers/ops.agent.js';
+export type {
+  OpsTask,
+  OpsResult,
+  OpsAction,
+  OpsStep,
+  OpsSeverity,
+  OpsIncidentTriage,
+  OpsRollbackPlan,
+} from './workers/ops.agent.js';
+
+export { VoiceAgent } from './workers/voice.agent.js';
+export type {
+  VoiceTask,
+  VoiceResult,
+  VoiceAction,
+  ActionItem,
+  CallDecision,
+  SpeakerStats,
+} from './workers/voice.agent.js';
+
+// Role manifest — honest per-role maturity classification
+export {
+  ROLE_MANIFEST,
+  getRoleManifestEntry,
+  listRoleManifest,
+  getRoleManifestSummary,
+  getReflectionMode,
+} from './role-manifest.js';
+export type { RoleMaturity, RoleManifestEntry } from './role-manifest.js';
+
+export { KnowledgeAgent } from './workers/knowledge.agent.js';
+export type { KnowledgeTask, KnowledgeResult } from './workers/knowledge.agent.js';
+
+// Expert / Executive agents
+export { CoderAgent } from './workers/coder.agent.js';
+export type { CoderTask, CoderResult } from './workers/coder.agent.js';
+
+export { DesignerAgent } from './workers/designer.agent.js';
+export type { DesignerTask, DesignerResult } from './workers/designer.agent.js';
+
+export { StrategistAgent } from './workers/strategist.agent.js';
+export type { StrategistTask, StrategistResult } from './workers/strategist.agent.js';
+
+export { MarketingAgent } from './workers/marketing.agent.js';
+export type { MarketingTask, MarketingResult } from './workers/marketing.agent.js';
+
+export { TechnicalAgent } from './workers/technical.agent.js';
+export type { TechnicalTask, TechnicalResult } from './workers/technical.agent.js';
+
+export { FinanceAgent } from './workers/finance.agent.js';
+export type { FinanceTask, FinanceResult } from './workers/finance.agent.js';
+
+export { HRAgent } from './workers/hr.agent.js';
+export type { HRTask, HRResult } from './workers/hr.agent.js';
+
+export { GrowthAgent } from './workers/growth.agent.js';
+export type { GrowthAction, GrowthTask, GrowthResult } from './workers/growth.agent.js';
+
+// Autonomous company agents
+export { ContentAgent } from './workers/content.agent.js';
+export type { ContentAction, ContentTask, ContentResult } from './workers/content.agent.js';
+
+export { SEOAgent } from './workers/seo.agent.js';
+export type { SEOAction, SEOTask, SEOResult } from './workers/seo.agent.js';
+
+export { PRAgent } from './workers/pr.agent.js';
+export type { PRAction, PRTask, PRResult } from './workers/pr.agent.js';
+
+export { LegalAgent } from './workers/legal.agent.js';
+export type { LegalAction, LegalTask, LegalResult } from './workers/legal.agent.js';
+
+export { SuccessAgent } from './workers/success.agent.js';
+export type { SuccessAction, SuccessTask, SuccessResult } from './workers/success.agent.js';
+
+export { AnalyticsAgent } from './workers/analytics.agent.js';
+export type { AnalyticsAction, AnalyticsTask, AnalyticsResult } from './workers/analytics.agent.js';
+
+export { ProductAgent } from './workers/product.agent.js';
+export type { ProductAction, ProductTask, ProductResult } from './workers/product.agent.js';
+
+export { ProjectAgent } from './workers/project.agent.js';
+export type { ProjectAction, ProjectTask, ProjectResult } from './workers/project.agent.js';
+
+// Vibe Coding agents
+export { AppArchitectAgent } from './workers/app-architect.agent.js';
+export type { AppArchitectAction, AppArchitectTask, AppArchitectResult } from './workers/app-architect.agent.js';
+
+export { AppGeneratorAgent } from './workers/app-generator.agent.js';
+export type { AppGeneratorAction, AppGeneratorTask, AppGeneratorResult, GeneratedFile } from './workers/app-generator.agent.js';
+
+export { AppDebuggerAgent } from './workers/app-debugger.agent.js';
+export type { AppDebuggerAction, AppDebuggerTask, AppDebuggerResult } from './workers/app-debugger.agent.js';
+
+export { AppDeployerAgent } from './workers/app-deployer.agent.js';
+export type {
+  AppDeployerAction,
+  AppDeployerTask,
+  AppDeployerResult,
+  BuildErrorClassification,
+  EnvVarPreflight,
+  DomainStatus,
+  RollbackRecommendation,
+} from './workers/app-deployer.agent.js';
+
+export { ScreenshotToCodeAgent } from './workers/screenshot-to-code.agent.js';
+export type { ScreenshotToCodeAction, ScreenshotToCodeTask, ScreenshotToCodeResult } from './workers/screenshot-to-code.agent.js';
+
+// ─── Phase 2-7 — Runtime layer ──────────────────────────────────────────────
+export {
+  getRuntime,
+  LegacyRuntime,
+  OpenAIRuntime,
+  GeminiRuntime,
+  ensureModelMap,
+  getModelMapSync,
+  modelForTier,
+  modelForGeminiTier,
+  getDefaultGeminiModel,
+  isGeminiModel,
+  smokeResponsesApi,
+} from './runtime/index.js';
+export type { ProviderHints } from './runtime/index.js';
+
+// Phase 4 schemas — strict zod schemas for Planner / Commander / Research
+// outputs. Both runtimes validate; OpenAIRuntime enforces at the model layer.
+export {
+  CommanderResponseSchema,
+  PlannerResponseSchema,
+  ResearchResponseSchema,
+} from './runtime/schemas/index.js';
+export type {
+  CommanderResponseT,
+  PlannerResponseT,
+  PlannerTaskT,
+  ResearchResponseT,
+} from './runtime/schemas/index.js';
+export type {
+  LLMRuntime,
+  LLMCallOptions,
+  ToolLoopOptions,
+  // ToolLoopResult is also re-exported from BaseAgent at top of this file —
+  // both interfaces are structurally identical so callers see one type.
+  HostedToolsConfig,
+  LegacyAgentBackend,
+  ModelTier,
+  ResolvedModelMap,
+  ResponsesSmokeResult,
+} from './runtime/index.js';
+
+// ─── Phase 8 — Benchmark harness ────────────────────────────────────────────
+export {
+  runHarness,
+  PERSONA_CORE_SCENARIOS,
+} from './benchmarks/index.js';
+export type {
+  BenchmarkScenario,
+  BenchmarkResult,
+  BenchmarkReport,
+} from './benchmarks/index.js';

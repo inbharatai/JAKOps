@@ -1,0 +1,396 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable && corepack prepare pnpm@9.15.4 --activate
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma Client
+        run: pnpm --filter @jak-swarm/db exec prisma generate
+
+      - name: Build all packages (dependency order)
+        # @jak-swarm/security MUST build before db: workflow encryption
+        # extensions import field-cipher helpers from @jak-swarm/security.
+        # @jak-swarm/db MUST still build before tools because Track 2's
+        # find_document tool imports Prisma's `prisma` singleton from db.
+        run: |
+          pnpm --filter @jak-swarm/shared build
+          pnpm --filter @jak-swarm/industry-packs build
+          pnpm --filter @jak-swarm/verification build
+          pnpm --filter @jak-swarm/security build
+          pnpm --filter @jak-swarm/db build
+          pnpm --filter @jak-swarm/tools build
+          # @jak-swarm/skills MUST build before @jak-swarm/agents — agents
+          # imports it via `await import('@jak-swarm/skills')` in
+          # `BaseAgent.injectBundledSkills` and TS needs the .d.ts to resolve
+          # the dynamic-import type. (OpenClaw-inspired Phase 1, Item A.)
+          pnpm --filter @jak-swarm/skills build
+          pnpm --filter @jak-swarm/agents build
+          pnpm --filter @jak-swarm/swarm build
+          # @jak-swarm/adk depends on swarm + agents + tools + shared; api depends on adk
+          pnpm --filter @jak-swarm/adk build
+          pnpm --filter @jak-swarm/client build
+          pnpm --filter @jak-swarm/voice build
+          pnpm --filter @jak-swarm/workflows build
+          pnpm --filter @jak-swarm/whatsapp-client build
+          pnpm --filter @jak-swarm/api build
+
+      - name: Build web app
+        run: pnpm --filter @jak-swarm/web exec next build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder_key
+
+      - name: Build production Docker image
+        run: docker build --target runtime .
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: jakswarm
+          POSTGRES_PASSWORD: jakswarm
+          POSTGRES_DB: jakswarm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jakswarm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable && corepack prepare pnpm@9.15.4 --activate
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma Client
+        run: pnpm --filter @jak-swarm/db exec prisma generate
+
+      - name: Apply database migrations
+        run: pnpm --filter @jak-swarm/db db:migrate:deploy
+        env:
+          DATABASE_URL: postgresql://jakswarm:jakswarm@localhost:5432/jakswarm
+          DIRECT_URL: postgresql://jakswarm:jakswarm@localhost:5432/jakswarm
+
+      - name: Build packages (dependency order)
+        run: |
+          pnpm --filter @jak-swarm/shared build
+          pnpm --filter @jak-swarm/industry-packs build
+          pnpm --filter @jak-swarm/verification build
+          pnpm --filter @jak-swarm/security build
+          pnpm --filter @jak-swarm/db build
+          pnpm --filter @jak-swarm/tools build
+          # @jak-swarm/skills before @jak-swarm/agents — see Build & Typecheck
+          # job for rationale (BaseAgent.injectBundledSkills dynamic import).
+          pnpm --filter @jak-swarm/skills build
+          pnpm --filter @jak-swarm/agents build
+          pnpm --filter @jak-swarm/swarm build
+          # @jak-swarm/adk depends on swarm + agents + tools + shared; api depends on adk
+          pnpm --filter @jak-swarm/adk build
+          pnpm --filter @jak-swarm/client build
+          pnpm --filter @jak-swarm/voice build
+          pnpm --filter @jak-swarm/workflows build
+          pnpm --filter @jak-swarm/whatsapp-client build
+          pnpm --filter @jak-swarm/api build
+
+      - name: Run unit tests with coverage (blocking)
+        # Coverage thresholds live in tests/vitest.config.ts. Failing the
+        # threshold fails the build, so coverage floor enforcement is
+        # declarative and visible in the config, not hidden in this YAML.
+        #
+        # We run only the `unit/` and hand-picked `integration/circuit-breaker`
+        # + `integration/truth-claims` suites here because the remaining
+        # `integration/*` suite has drift from earlier API evolution that
+        # predates the Phase 1-3 hardening pass (see integration-drift job
+        # below). Unblocking new work while that drift is tracked separately.
+        # NOTE: unit/agents/*behavioral*.test.ts files call the live OpenAI API
+        # and require a real OPENAI_API_KEY. They are excluded here so CI stays green
+        # for structural + service + route tests. Run behavioral tests locally with
+        # OPENAI_API_KEY=sk-... when validating agent behavior changes.
+        run: pnpm --filter @jak-swarm/tests exec vitest run --coverage unit integration/circuit-breaker.test.ts integration/truth-claims.test.ts --exclude "**/*behavioral*.test.ts" --exclude "**/role-world-class-upgrades.test.ts"
+        env:
+          NODE_ENV: test
+          AUTH_SECRET: ci-test-secret-change-me
+          DATABASE_URL: postgresql://jakswarm:jakswarm@localhost:5432/jakswarm
+          DIRECT_URL: postgresql://jakswarm:jakswarm@localhost:5432/jakswarm
+          REDIS_URL: redis://localhost:6379
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Run integration tests (blocking)
+        # The 12 drifts formerly tracked in docs/TEST-DRIFT.md were fixed in
+        # Sprint 6 — the assertions now match the actual route contracts
+        # (pagination envelope, 202 for async workflow creation, schedules
+        # body shape, content-type only when body is present). If this step
+        # starts failing, assume it is a genuine regression and fix the
+        # test or the route — don't re-add continue-on-error.
+        run: pnpm --filter @jak-swarm/tests exec vitest run integration --exclude '**/circuit-breaker.test.ts' --exclude '**/truth-claims.test.ts'
+        env:
+          NODE_ENV: test
+          AUTH_SECRET: ci-test-secret-change-me
+          DATABASE_URL: postgresql://jakswarm:jakswarm@localhost:5432/jakswarm
+          DIRECT_URL: postgresql://jakswarm:jakswarm@localhost:5432/jakswarm
+          REDIS_URL: redis://localhost:6379
+
+  # ---------------------------------------------------------------------------
+  # Security gate — blocks merge/deploy if hardened defaults are violated
+  # ---------------------------------------------------------------------------
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Fail if default AUTH_SECRET is committed anywhere
+        run: |
+          if grep -rn "dev-secret-change-me-NEVER-USE-IN-PROD" \
+            --include="*.ts" --include="*.js" --include="*.json" \
+            --exclude-dir=node_modules --exclude-dir=dist \
+            --exclude="config.ts" \
+            --exclude="validate-config.ts" \
+            .; then
+            echo "::error::Default AUTH_SECRET found in source — rotate it immediately."
+            exit 1
+          fi
+          echo "No hardcoded default auth secrets found."
+
+      - name: Fail if real API keys are committed
+        run: |
+          # Patterns that look like real secrets (not placeholders)
+          if grep -rEn "(sk-[A-Za-z0-9]{32,}|sk-ant-[A-Za-z0-9-]{40,}|AIza[A-Za-z0-9_-]{35})" \
+            --include="*.ts" --include="*.js" --include="*.env*" \
+            --exclude-dir=node_modules --exclude-dir=dist \
+            --exclude="*.example" \
+            . 2>/dev/null; then
+            echo "::error::Possible real API key committed to source — review and revoke."
+            exit 1
+          fi
+          echo "No hardcoded API keys found."
+
+      - name: Ensure .env is gitignored
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env file is tracked by git — add it to .gitignore immediately."
+            exit 1
+          fi
+          echo ".env is not tracked by git."
+
+      - name: Validate production boot guard exists
+        run: |
+          if ! grep -qE "(process\.exit\(1\)|throw new Error)" apps/api/src/boot/validate-config.ts; then
+            echo "::error::Production boot guard missing from validate-config.ts — server must refuse to start on bad config"
+            exit 1
+          fi
+          echo "Production boot guard is present."
+
+  # ---------------------------------------------------------------------------
+  # Gitleaks — deeper secret scanning with a mature ruleset.
+  # Runs against the full history on the branch; fails on any hit that isn't
+  # whitelisted in .gitleaks.toml (placeholders, test fixtures).
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret Scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  # ---------------------------------------------------------------------------
+  # Dependency audit — blocks merge if any transitive prod dep has a known
+  # high/critical CVE. Dependabot PRs flow through this same gate so security
+  # fixes can never regress silently.
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    name: Dependency Audit (pnpm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable && corepack prepare pnpm@9.15.4 --activate
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit production dependencies (fail on high/critical)
+        # --prod limits the scan to what ships to users; dev-only tooling (eslint,
+        # vitest, etc.) is intentionally excluded so a vulnerability in, say, a
+        # test helper can't block a release.
+        run: pnpm audit --audit-level=high --prod
+
+  # ---------------------------------------------------------------------------
+  # SBOM generation — emits a CycloneDX software bill of materials for every
+  # push to main. Operators or auditors pulling a release can answer "what
+  # library versions were in production on date X" without a rebuild.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable && corepack prepare pnpm@9.15.4 --activate
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate CycloneDX SBOM (via syft)
+        # Syft reads pnpm-lock.yaml directly and emits a CycloneDX 1.5 JSON.
+        # Unlike @cyclonedx/cyclonedx-npm (which relies on `npm ls` and can't
+        # resolve pnpm symlink layouts) and cdxgen (which compiles native
+        # sqlite), syft is a single Go binary — no install, no native deps.
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./
+          format: cyclonedx-json
+          output-file: sbom.json
+          artifact-name: sbom-${{ github.sha }}
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.json
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Truth check — blocks merge if README / landing-page claims drift from the
+  # live tool manifest and integration maturity matrix.
+  # ---------------------------------------------------------------------------
+  truth-check:
+    name: Docs Truth Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable && corepack prepare pnpm@9.15.4 --activate
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma Client
+        # Must run before @jak-swarm/db's TS build — @prisma/client type exports
+        # are generated output, not hand-written. Same reason the main build job
+        # runs this step too.
+        run: pnpm --filter @jak-swarm/db exec prisma generate
+
+      - name: Build packages required by the truth-check script
+        run: |
+          pnpm --filter @jak-swarm/shared build
+          pnpm --filter @jak-swarm/industry-packs build
+          pnpm --filter @jak-swarm/verification build
+          pnpm --filter @jak-swarm/security build
+          pnpm --filter @jak-swarm/db build
+          pnpm --filter @jak-swarm/tools build
+
+      - name: Run docs truth check
+        run: pnpm check:truth
+
+      - name: Upload truth report artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: truth-report
+          path: docs/_generated/truth-report.json
+          if-no-files-found: warn

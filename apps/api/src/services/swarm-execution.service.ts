@@ -1,0 +1,2412 @@
+/**
+ * SwarmExecutionService
+ *
+ * Bridges the @jak-swarm/swarm runner with the WorkflowService (DB persistence).
+ * Designed to be called from background tasks — HTTP handlers kick off execution
+ * via setImmediate() and return 202 immediately; this service drives the swarm
+ * and writes all results to Postgres.
+ */
+import { EventEmitter } from 'node:events';
+import type { PrismaClient } from '@jak-swarm/db';
+import type { FastifyBaseLogger } from 'fastify';
+import { SwarmRunner, supervisorBus, getWorkflowRuntime } from '@jak-swarm/swarm';
+import type { SwarmResult, WorkflowRuntime, WorkflowLifecycleEvent } from '@jak-swarm/swarm';
+import { config } from '../config.js';
+import { Industry, ToolRiskClass, WorkflowStatus } from '@jak-swarm/shared';
+import type { AgentTrace as SharedAgentTrace, ApprovalRequest as SharedApprovalRequest } from '@jak-swarm/shared';
+import { COMPANY_OS_INTENTS, INTENT_REQUIRED_CONTEXT, type CompanyOSIntent } from '@jak-swarm/agents';
+import { IntentRecordService } from './company-brain/intent-record.service.js';
+import { CompanyProfileService } from './company-brain/company-profile.service.js';
+import { WorkflowTemplateService } from './company-brain/workflow-template.service.js';
+import { CEOOrchestratorService, type CEOPreFlightResult } from './ceo-orchestrator.service.js';
+import { getIndustryPack } from '@jak-swarm/industry-packs';
+import { AuditLogger, AuditAction, classifyToolRisk, getShieldGateway } from '@jak-swarm/security';
+import type { AuditPrismaClient } from '@jak-swarm/security';
+import { toolRegistry } from '@jak-swarm/tools';
+import { WorkflowService } from './workflow.service.js';
+import { DbWorkflowStateStore } from './db-state-store.js';
+import { QueueWorker } from './queue-worker.js';
+import type { WorkflowJobRow, WorkerHealth } from './queue-worker.js';
+
+/**
+ * Strip non-JSON-serializable values from a deep object graph.
+ *
+ * Why: Prisma persists `workflow.stateJson` as JSONB. Any `Function`, `Symbol`,
+ * BigInt, undefined, or circular reference crashes the write with an
+ * unhelpful `[object Function]` serialize error. That had been masking
+ * workflow failures in production — the state persist silently failed and
+ * a subsequent resume couldn't find the checkpoint.
+ *
+ * Policy:
+ *   - Functions, Symbols, BigInts, undefined → dropped
+ *   - Circular refs → replaced with string `'[circular]'`
+ *   - Dates → ISO string
+ *   - Everything else → passed through
+ */
+function stripNonSerializable(input: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+  if (input === null || input === undefined) return input;
+  const t = typeof input;
+  if (t === 'function' || t === 'symbol' || t === 'bigint') return undefined;
+  if (t !== 'object') return input;
+  if (input instanceof Date) return input.toISOString();
+  if (seen.has(input as object)) return '[circular]';
+  seen.add(input as object);
+  if (Array.isArray(input)) {
+    return input
+      .map((v) => stripNonSerializable(v, seen))
+      .filter((v) => v !== undefined);
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    const cleaned = stripNonSerializable(v, seen);
+    if (cleaned !== undefined) out[k] = cleaned;
+  }
+  return out;
+}
+
+/**
+ * Map the rich internal WorkflowStatus enum to the DB-persisted string literal.
+ * The swarm uses fine-grained statuses; the API surface and DB use a simpler set.
+ */
+function mapSwarmStatusToDb(
+  swarmStatus: string,
+): 'PENDING' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'FAILED' | 'CANCELLED' {
+  switch (swarmStatus) {
+    case 'PLANNING':
+    case 'ROUTING':
+    case 'EXECUTING':
+    case 'VERIFYING':
+    case 'RUNNING':
+      return 'RUNNING';
+    case 'AWAITING_APPROVAL':
+      return 'PAUSED';
+    case 'COMPLETED':
+      return 'COMPLETED';
+    case 'FAILED':
+      return 'FAILED';
+    case 'CANCELLED':
+      return 'CANCELLED';
+    default:
+      return 'RUNNING';
+  }
+}
+
+export interface ExecuteAsyncParams {
+  workflowId: string;
+  tenantId: string;
+  userId: string;
+  goal: string;
+  industry?: string;
+  roleModes?: string[];
+  maxCostUsd?: number;
+  conversationId?: string;
+  /** Caller-provided idempotency key to prevent duplicate execution on replays. */
+  idempotencyKey?: string;
+  /**
+   * Coarse tier for gating paid external services (Serper / Tavily). Populated
+   * at workflow creation from `Subscription.maxModelTier`. 'free' forces DDG-only
+   * search chain; 'paid' (or undefined) allows Serper primary.
+   */
+  subscriptionTier?: 'free' | 'paid';
+  /**
+   * Which workflow pipeline to run. Default 'standard' drives the general
+   * SwarmGraph (commander → planner → worker → verifier). 'vibe-coder' drives
+   * the dedicated Architect → Generator → Debugger → Deployer chain with
+   * build-check + retry loop.
+   */
+  workflowKind?: 'standard' | 'vibe-coder';
+  /**
+   * Final-hardening Gap A — when 'ceo', the CEO super-orchestrator
+   * wraps the standard workflow with Company Brain context loading,
+   * executive-function tagging, and an LLM-generated executive
+   * summary at the end. When omitted, CEO mode is auto-detected from
+   * the goal text (see detectCEOTrigger). When 'standard', CEO mode
+   * is forced off even if the goal would have triggered it.
+   */
+  ceoMode?: 'ceo' | 'standard';
+  /**
+   * Item C (OpenClaw-inspired Phase 1) — StandingOrder boundary fields.
+   * The scheduler resolves the active StandingOrder(s) for the schedule
+   * + tenant and passes the merged boundary in. The executor then plumbs
+   * each through to SwarmState → AgentContext → TenantToolRegistry.
+   */
+  /** Tools the run is restricted to (whitelist). Empty = no whitelist. */
+  allowedToolNames?: string[];
+  /** Additional tool blocklist on top of tenant + industry-pack blocks. */
+  disabledToolNames?: string[];
+  /** Risk levels that ALWAYS require human approval regardless of auto-approve. */
+  approvalRequiredFor?: string[];
+  /** Audit-trail label: who/what triggered this run. */
+  triggeredBy?: 'manual' | 'schedule' | 'standing_order';
+  /** Optional FK back to the StandingOrder that produced the boundary. */
+  standingOrderId?: string;
+  /** Optional payload for vibe-coder workflows (app spec + builder inputs). */
+  vibeCoderInput?: {
+    description: string;
+    framework?: string;
+    features?: string[];
+    existingFiles?: Array<{ path: string; content: string; language: string }>;
+    projectName?: string;
+    envVars?: Record<string, string>;
+    deployAfterBuild?: boolean;
+    maxDebugRetries?: number;
+    /**
+     * Optional — when set, the executor persists generated files to this
+     * project (via ProjectService) and records a checkpoint (via
+     * CheckpointService) after each stage. Absent = ephemeral run, no
+     * project rows touched.
+     */
+    projectId?: string;
+  };
+}
+
+export interface ResumeParams {
+  workflowId: string;
+  tenantId: string;
+  decision: 'APPROVED' | 'REJECTED' | 'DEFERRED';
+  reviewedBy: string;
+  comment?: string;
+  /** Optional — populated when known so the lifecycle audit row carries the approval id. */
+  approvalId?: string;
+}
+
+export interface CancelParams {
+  workflowId: string;
+  /** Optional — who triggered the cancel. Audit trail field. */
+  cancelledBy?: string;
+  /** Optional — reason string for the audit row. */
+  reason?: string;
+  /** Optional — tenant id used to scope the audit log entry. */
+  tenantId?: string;
+}
+
+/** Control actions that flow through the durable queue alongside normal executions. */
+export type ControlAction = 'resume' | 'cancel';
+
+export interface EnqueueControlParams {
+  action: ControlAction;
+  workflowId: string;
+  tenantId: string;
+  userId: string;
+  /** Required for action='resume'. Ignored for action='cancel'. */
+  decision?: 'APPROVED' | 'REJECTED' | 'DEFERRED';
+  /** Required for action='resume'. The reviewer's userId. */
+  reviewedBy?: string;
+  /** Optional free-text comment attached to the resume decision. */
+  comment?: string;
+  /** Optional approval row resolved before enqueue; carried into audit/resume state. */
+  approvalId?: string;
+  /** Idempotency key — prevents duplicate execution on network retries. */
+  idempotencyKey?: string;
+}
+
+type ReplaySafetyClass =
+  | 'REPLAY_SAFE'
+  | 'REPLAY_UNSAFE'
+  | 'REQUIRES_IDEMPOTENCY_KEY'
+  | 'MANUAL_INTERVENTION_REQUIRED';
+
+function classifyReplaySafety(state: Record<string, unknown>): {
+  safety: ReplaySafetyClass;
+  reason: string;
+  taskId?: string;
+} {
+  const plan = state['plan'] as { tasks?: Array<Record<string, unknown>> } | undefined;
+  const currentTaskIndex = typeof state['currentTaskIndex'] === 'number'
+    ? state['currentTaskIndex']
+    : 0;
+  const task = plan?.tasks?.[currentTaskIndex];
+
+  if (!task) {
+    return { safety: 'REPLAY_SAFE', reason: 'No active task at checkpoint boundary' };
+  }
+
+  const taskId = typeof task['id'] === 'string' ? task['id'] : undefined;
+  const requiresApproval = Boolean(task['requiresApproval']);
+  const tools = Array.isArray(task['toolsRequired'])
+    ? task['toolsRequired'].filter((v): v is string => typeof v === 'string')
+    : [];
+
+  const toolRisks = tools.map((name) => {
+    const metadata = toolRegistry.get(name)?.metadata;
+    return {
+      name,
+      riskClass: classifyToolRisk(name, metadata),
+      requiresApproval: metadata?.requiresApproval ?? false,
+    };
+  });
+
+  const hasExternalOrDestructive = toolRisks.some((tool) =>
+    tool.riskClass === ToolRiskClass.EXTERNAL_SIDE_EFFECT || tool.riskClass === ToolRiskClass.DESTRUCTIVE,
+  );
+  const hasWrite = toolRisks.some((tool) => tool.riskClass === ToolRiskClass.WRITE);
+  const toolRequiresApproval = toolRisks.some((tool) => tool.requiresApproval);
+
+  if (requiresApproval || toolRequiresApproval || hasExternalOrDestructive) {
+    return {
+      safety: 'MANUAL_INTERVENTION_REQUIRED',
+      reason: 'Task includes approval-gated or high side-effect tools that are not replay-safe',
+      taskId,
+    };
+  }
+
+  const readOnlyOnly = tools.length === 0 || toolRisks.every((tool) => tool.riskClass === ToolRiskClass.READ_ONLY);
+
+  if (readOnlyOnly) {
+    return {
+      safety: 'REPLAY_SAFE',
+      reason: 'Task appears read-only or analysis-only',
+      taskId,
+    };
+  }
+
+  if (hasWrite) {
+    return {
+      safety: 'REQUIRES_IDEMPOTENCY_KEY',
+      reason: 'Task includes write tools; replay should use idempotency keys before auto-resume',
+      taskId,
+    };
+  }
+
+  return {
+    safety: 'REPLAY_UNSAFE',
+    reason: 'Task includes unclassified tools; replay safety cannot be guaranteed',
+    taskId,
+  };
+}
+
+export class SwarmExecutionService extends EventEmitter {
+  private readonly runner: SwarmRunner;
+  private readonly workflowRuntime!: WorkflowRuntime;
+
+  /**
+   * Hardening pass — single chokepoint that turns a canonical
+   * WorkflowLifecycleEvent into BOTH an AuditLog row AND an SSE event
+   * for the cockpit. The audit row is the durable record (the Audit &
+   * Compliance product reads from there); the SSE is the live mirror.
+   *
+   * This emitter is wired into runner.run({ onAgentActivity }) AND into
+   * the resume + cancel paths so every observable transition produces
+   * an audit row even if the cockpit never connects.
+   */
+  /**
+   * Migration 16 — emit intent_detected, persist IntentRecord, then check
+   * required CompanyProfile context per intent. If a required context
+   * field is missing on the approved profile, emit company_context_missing
+   * so the cockpit can surface "we need your brand voice" / etc.
+   *
+   * Workflow_selected fires when a tenant has a matching WorkflowTemplate
+   * for the detected intent.
+   *
+   * Best-effort: any persistence failure logs + continues. Never blocks.
+   */
+  private async persistIntentAndContext(input: {
+    workflowId: string;
+    tenantId: string;
+    userId: string;
+    goal: string;
+    result: { missionBrief?: { intent?: string; intentConfidence?: number | null; subFunction?: string; urgency?: number; riskIndicators?: string[]; requiredOutputs?: string[]; clarificationNeeded?: boolean; clarificationQuestion?: string }; directAnswer?: string };
+  }): Promise<void> {
+    const intentRecords = new IntentRecordService(this.db, this.log);
+    const profileSvc = new CompanyProfileService(this.db, this.log);
+    const templateSvc = new WorkflowTemplateService(this.db, this.log);
+
+    // 1. Determine the intent from the result.
+    let intent: CompanyOSIntent;
+    let intentConfidence: number | null = null;
+    let directAnswer: string | undefined;
+    let clarificationNeeded = false;
+    let clarificationQuestion: string | null = null;
+    let subFunction: string | undefined;
+    let urgency: number | undefined;
+    let riskIndicators: string[] | undefined;
+    let requiredOutputs: string[] | undefined;
+
+    if (input.result.directAnswer) {
+      intent = 'general_question';
+      directAnswer = input.result.directAnswer;
+    } else if (input.result.missionBrief?.clarificationNeeded) {
+      intent = 'ambiguous_request';
+      clarificationNeeded = true;
+      clarificationQuestion = input.result.missionBrief.clarificationQuestion ?? null;
+    } else if (input.result.missionBrief) {
+      const raw = input.result.missionBrief.intent ?? '';
+      intent = (COMPANY_OS_INTENTS as readonly string[]).includes(raw)
+        ? (raw as CompanyOSIntent)
+        : 'ambiguous_request';
+      intentConfidence = input.result.missionBrief.intentConfidence ?? null;
+      subFunction = input.result.missionBrief.subFunction;
+      urgency = input.result.missionBrief.urgency;
+      riskIndicators = input.result.missionBrief.riskIndicators;
+      requiredOutputs = input.result.missionBrief.requiredOutputs;
+    } else {
+      // No mission brief AND no direct answer — Commander failed silently.
+      intent = 'ambiguous_request';
+    }
+
+    // 2. Try to find a matching WorkflowTemplate.
+    let templateId: string | undefined;
+    if (intent !== 'general_question' && intent !== 'ambiguous_request') {
+      try {
+        const template = await templateSvc.findForIntent({ tenantId: input.tenantId, intent });
+        if (template) {
+          templateId = template.id;
+          this.emitLifecycle({
+            type: 'workflow_selected',
+            workflowId: input.workflowId,
+            templateId: template.id,
+            templateName: template.name,
+            intent,
+            timestamp: new Date().toISOString(),
+          }, input.tenantId, input.userId);
+        }
+      } catch {/* schema may not be deployed yet — ignore */}
+    }
+
+    // 3. Persist IntentRecord (analytics + audit trail).
+    try {
+      await intentRecords.create({
+        tenantId: input.tenantId,
+        userId: input.userId,
+        workflowId: input.workflowId,
+        rawInput: input.goal,
+        intent,
+        intentConfidence,
+        ...(subFunction ? { subFunction } : {}),
+        ...(urgency !== undefined ? { urgency } : {}),
+        ...(riskIndicators ? { riskIndicators } : {}),
+        ...(requiredOutputs ? { requiredOutputs } : {}),
+        ...(templateId ? { workflowTemplateId: templateId } : {}),
+        clarificationNeeded,
+        clarificationQuestion,
+        ...(directAnswer ? { directAnswer } : {}),
+      });
+    } catch {/* schema may not be deployed yet — ignore */}
+
+    // 4. Emit intent_detected lifecycle event.
+    this.emitLifecycle({
+      type: 'intent_detected',
+      workflowId: input.workflowId,
+      intent,
+      intentConfidence,
+      ...(subFunction ? { subFunction } : {}),
+      ...(urgency !== undefined ? { urgency } : {}),
+      timestamp: new Date().toISOString(),
+    }, input.tenantId, input.userId);
+
+    // 5. Emit clarification_required when the brief asked for clarification.
+    if (clarificationNeeded && clarificationQuestion) {
+      this.emitLifecycle({
+        type: 'clarification_required',
+        workflowId: input.workflowId,
+        question: clarificationQuestion,
+        timestamp: new Date().toISOString(),
+      }, input.tenantId, input.userId);
+    }
+
+    // 6. Check required CompanyProfile context per intent. Emit
+    // company_context_missing when fields are absent on the APPROVED
+    // profile (extracted-but-unapproved doesn't count for grounding).
+    const requiredFields = INTENT_REQUIRED_CONTEXT[intent] ?? [];
+    if (requiredFields.length > 0) {
+      try {
+        const profile = await profileSvc.getApproved(input.tenantId);
+        const missing = requiredFields.filter((field) => {
+          if (!profile) return true;
+          const v = (profile as unknown as Record<string, unknown>)[field];
+          return v === null || v === undefined || (typeof v === 'string' && v.trim().length === 0);
+        });
+        if (missing.length > 0) {
+          this.emitLifecycle({
+            type: 'company_context_missing',
+            workflowId: input.workflowId,
+            intent,
+            missingFields: missing,
+            timestamp: new Date().toISOString(),
+          }, input.tenantId, input.userId);
+        }
+      } catch {/* schema may not be deployed yet — ignore */}
+    }
+  }
+
+  private emitLifecycle(ev: WorkflowLifecycleEvent, tenantId: string, userId?: string): void {
+    // 1. Live SSE for the cockpit. Some events (e.g. retention sweep) are
+    //    workflow-agnostic and have an optional workflowId; only emit on
+    //    the SSE channel when one is present.
+    const wfId = (ev as { workflowId?: string }).workflowId;
+    if (wfId) {
+      this.emit(`workflow:${wfId}`, { ...ev, kind: 'lifecycle' });
+    }
+
+    // 2. Durable audit row — fire-and-forget, never block the runtime
+    const actionMap: Partial<Record<WorkflowLifecycleEvent['type'], AuditAction>> = {
+      created: AuditAction.WORKFLOW_CREATED,
+      planned: AuditAction.WORKFLOW_PLANNED,
+      started: AuditAction.WORKFLOW_STARTED,
+      step_started: AuditAction.WORKFLOW_STEP_STARTED,
+      step_completed: AuditAction.WORKFLOW_STEP_COMPLETED,
+      step_failed: AuditAction.WORKFLOW_STEP_FAILED,
+      approval_required: AuditAction.APPROVAL_REQUESTED,
+      approval_granted: AuditAction.APPROVAL_GRANTED,
+      approval_rejected: AuditAction.APPROVAL_REJECTED,
+      resumed: AuditAction.WORKFLOW_RESUMED,
+      cancelled: AuditAction.WORKFLOW_CANCELLED,
+      completed: AuditAction.WORKFLOW_COMPLETED,
+      failed: AuditAction.WORKFLOW_FAILED,
+      // Migration 16 — new typed events. Mapped to closest existing
+      // AuditAction so we don't need a schema migration for AuditLog.
+      // The full event payload is preserved in the `details` JSON column.
+      intent_detected: AuditAction.WORKFLOW_PLANNED,
+      clarification_required: AuditAction.WORKFLOW_PLANNED,
+      clarification_answered: AuditAction.WORKFLOW_RESUMED,
+      workflow_selected: AuditAction.WORKFLOW_PLANNED,
+      agent_assigned: AuditAction.WORKFLOW_STEP_STARTED,
+      verification_started: AuditAction.WORKFLOW_STEP_STARTED,
+      verification_completed: AuditAction.WORKFLOW_STEP_COMPLETED,
+      context_summarized: AuditAction.WORKFLOW_STEP_STARTED,
+      company_context_loaded: AuditAction.MEMORY_READ,
+      company_context_used_by_agent: AuditAction.MEMORY_READ,
+      company_context_missing: AuditAction.WORKFLOW_PLANNED,
+      company_memory_suggested: AuditAction.MEMORY_WRITTEN,
+      company_memory_approved: AuditAction.APPROVAL_GRANTED,
+      company_memory_rejected: AuditAction.APPROVAL_REJECTED,
+      // Final-hardening Gap A — CEO super-orchestrator events.
+      ceo_goal_understood: AuditAction.WORKFLOW_PLANNED,
+      ceo_context_loaded: AuditAction.MEMORY_READ,
+      ceo_workflow_selected: AuditAction.WORKFLOW_PLANNED,
+      ceo_agents_assigned: AuditAction.WORKFLOW_STEP_STARTED,
+      ceo_plan_created: AuditAction.WORKFLOW_PLANNED,
+      ceo_blocker_detected: AuditAction.WORKFLOW_PLANNED,
+      ceo_escalation_created: AuditAction.APPROVAL_REQUESTED,
+      ceo_final_summary_generated: AuditAction.WORKFLOW_COMPLETED,
+      // Final-hardening Gap B — auto-repair events.
+      repair_needed: AuditAction.WORKFLOW_STEP_FAILED,
+      repair_attempt_started: AuditAction.WORKFLOW_STEP_STARTED,
+      repair_attempt_completed: AuditAction.WORKFLOW_STEP_COMPLETED,
+      repair_attempt_failed: AuditAction.WORKFLOW_STEP_FAILED,
+      repair_escalated_to_human: AuditAction.APPROVAL_REQUESTED,
+      repair_limit_reached: AuditAction.WORKFLOW_FAILED,
+      // Final-hardening Gap E — retention sweep events.
+      retention_sweep_started: AuditAction.ADMIN_ACTION,
+      retention_candidate_found: AuditAction.ADMIN_ACTION,
+      retention_item_deleted: AuditAction.MEMORY_DELETED,
+      retention_item_skipped: AuditAction.ADMIN_ACTION,
+      retention_sweep_completed: AuditAction.ADMIN_ACTION,
+      retention_sweep_failed: AuditAction.ADMIN_ACTION,
+    };
+    const action = actionMap[ev.type];
+    if (!action) return;
+    const auditWorkflowId = (ev as { workflowId?: string }).workflowId;
+    void this.audit
+      .log({
+        action,
+        tenantId,
+        ...(userId ? { userId } : {}),
+        resource: 'workflow',
+        ...(auditWorkflowId ? { resourceId: auditWorkflowId } : {}),
+        details: ev as unknown as Record<string, unknown>,
+      })
+      .catch((err) => {
+        this.log.warn(
+          { workflowId: auditWorkflowId, err: err instanceof Error ? err.message : String(err) },
+          '[lifecycle] audit log failed (non-fatal)',
+        );
+      });
+  }
+  private readonly workflowService: WorkflowService;
+  private readonly audit: AuditLogger;
+  private readonly queueWorker: QueueWorker;
+  private readonly maxConcurrentExecutions = Math.max(
+    1,
+    Number.parseInt(process.env['WORKFLOW_QUEUE_CONCURRENCY'] ?? '2', 10) || 2,
+  );
+  private readonly queuePollIntervalMs = Math.max(
+    250,
+    Number.parseInt(process.env['WORKFLOW_QUEUE_POLL_INTERVAL_MS'] ?? '1000', 10) || 1000,
+  );
+  private lockProvider: { acquire: (key: string, ttlMs: number) => Promise<string | null>; release: (key: string, token: string) => Promise<boolean> } | null = null;
+  private redisPublisher: { publish: (ch: string, msg: string) => Promise<unknown> } | null = null;
+  private instanceId = `jak-${process.pid}-${Date.now().toString(36)}`;
+
+  constructor(
+    private readonly db: PrismaClient,
+    private readonly log: FastifyBaseLogger,
+  ) {
+    super();
+    const stateStore = new DbWorkflowStateStore(db);
+    // Sprint 2.5 / A.6 — SwarmGraph deleted. SwarmRunner is now a thin
+    // facade over LangGraphRuntime; it requires the Prisma client to
+    // construct the PostgresCheckpointSaver internally.
+    this.runner = new SwarmRunner({
+      defaultTimeoutMs: 20 * 60 * 1000,
+      stateStore,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      db: db as any,
+    });
+    // workflowRuntime is the same LangGraph runtime SwarmRunner uses
+    // internally, exposed for swarm-execution callers that need the
+    // direct WorkflowRuntime contract (start/resume/cancel/getState).
+    this.workflowRuntime = getWorkflowRuntime(this.runner, db as unknown as Parameters<typeof getWorkflowRuntime>[1]);
+    log.info({ runtime: this.workflowRuntime.name }, '[Swarm] WorkflowRuntime selected (LangGraph only)');
+    this.workflowService = new WorkflowService(db, log);
+    this.audit = new AuditLogger(db as unknown as AuditPrismaClient);
+
+    // Instantiate the dedicated queue worker — delegates job claiming/retry/DLQ.
+    // Jobs carry an optional `action` discriminator in their payload so the same queue
+    // can durably process executions, resume-after-approval, and cancels. Jobs without
+    // an `action` field default to 'execute' for backwards compatibility with any rows
+    // created before this change.
+    this.queueWorker = new QueueWorker(db, log, async (job: WorkflowJobRow) => {
+      const payload = (job.payloadJson ?? {}) as Record<string, unknown> & { action?: string };
+      const action = typeof payload.action === 'string' ? payload.action : 'execute';
+      try {
+        if (action === 'resume') {
+          await this.resumeAfterApproval({
+            workflowId: job.workflowId,
+            tenantId: job.tenantId,
+            decision: payload['decision'] as ResumeParams['decision'],
+            reviewedBy: String(payload['reviewedBy'] ?? job.userId),
+            comment: typeof payload['comment'] === 'string' ? (payload['comment'] as string) : undefined,
+            approvalId: typeof payload['approvalId'] === 'string' ? (payload['approvalId'] as string) : undefined,
+          });
+        } else if (action === 'cancel') {
+          await this.cancelWorkflow({ workflowId: job.workflowId });
+        } else {
+          // Dispatch on workflowKind — 'vibe-coder' drives the dedicated
+          // Architect → Generator → BuildCheck → Debugger → Deployer chain;
+          // anything else (or undefined) runs the general SwarmGraph.
+          const kind = typeof payload['workflowKind'] === 'string' ? payload['workflowKind'] : 'standard';
+          if (kind === 'vibe-coder') {
+            await this.executeVibeCoderAsync(payload as unknown as ExecuteAsyncParams);
+          } else {
+            await this.executeAsync(payload as unknown as ExecuteAsyncParams);
+          }
+        }
+        const workflow = await this.db.workflow.findUnique({
+          where: { id: job.workflowId },
+          select: { status: true, error: true },
+        });
+        return String(workflow?.status ?? 'FAILED') === 'FAILED' ? 'FAILED' : 'COMPLETED';
+      } catch {
+        return 'FAILED';
+      }
+    }, {
+      maxConcurrent: this.maxConcurrentExecutions,
+      pollIntervalMs: this.queuePollIntervalMs,
+    });
+
+    // Forward worker lifecycle events for observability
+    this.queueWorker.on('job:claimed', (e) => this.emit('worker:job:claimed', e));
+    this.queueWorker.on('job:completed', (e) => this.emit('worker:job:completed', e));
+    this.queueWorker.on('job:retried', (e) => this.emit('worker:job:retried', e));
+    this.queueWorker.on('job:dead', (e) => this.emit('worker:job:dead', e));
+  }
+
+  /** Inject distributed lock provider for multi-instance safety. */
+  setLockProvider(provider: { acquire: (key: string, ttlMs: number) => Promise<string | null>; release: (key: string, token: string) => Promise<boolean> }): void {
+    this.lockProvider = provider;
+  }
+
+  /**
+   * Enqueue a workflow execution request.
+   *
+   * This provides backpressure and durable intent semantics:
+   * the workflow row remains in PENDING until a queue worker claims it.
+   */
+  enqueueExecution(params: ExecuteAsyncParams): boolean {
+    // Tag the payload with an explicit action so the processor's dispatch is unambiguous
+    // even alongside resume/cancel control jobs in the same queue.
+    void this.upsertWorkflowJob({ ...params, action: 'execute' }).catch((err) => {
+      this.log.error(
+        { workflowId: params.workflowId, err: err instanceof Error ? err.message : String(err) },
+        '[SwarmQueue] Failed to enqueue workflow job',
+      );
+    });
+    return true;
+  }
+
+  /**
+   * Enqueue a durable control action (resume-after-approval, cancel).
+   *
+   * Replaces the previous `setImmediate(() => resumeAfterApproval(...))` pattern in the
+   * route handlers — that was fire-and-forget and would be lost if the API crashed after
+   * returning 202 but before the task fired. Control jobs share the `workflow_jobs` table
+   * with execution jobs and get the same atomic claim, retry/backoff, and dead-letter
+   * semantics that executions already have.
+   */
+  async enqueueControl(params: EnqueueControlParams): Promise<boolean> {
+    const { action, workflowId, tenantId, userId, decision, reviewedBy, comment, idempotencyKey } = params;
+
+    if (action === 'resume' && (!decision || !reviewedBy)) {
+      this.log.error(
+        { workflowId, action },
+        '[SwarmQueue] enqueueControl(resume) requires decision and reviewedBy',
+      );
+      return false;
+    }
+
+    const payload: Record<string, unknown> = {
+      action,
+      workflowId,
+      tenantId,
+      userId,
+    };
+    if (decision) payload['decision'] = decision;
+    if (reviewedBy) payload['reviewedBy'] = reviewedBy;
+    if (comment) payload['comment'] = comment;
+    if (params.approvalId) payload['approvalId'] = params.approvalId;
+    if (idempotencyKey) payload['idempotencyKey'] = idempotencyKey;
+
+    try {
+      await this.upsertWorkflowJob(payload as { workflowId: string; tenantId: string; userId: string } & Record<string, unknown>);
+      return true;
+    } catch (err) {
+      this.log.error(
+        { workflowId, action, err: err instanceof Error ? err.message : String(err) },
+        '[SwarmQueue] Failed to enqueue control action',
+      );
+      return false;
+    }
+  }
+
+  async getQueueStats(): Promise<{
+    queued: number;
+    active: number;
+    completed: number;
+    failed: number;
+    dead: number;
+    running: number;
+    maxConcurrent: number;
+  }> {
+    const jobModel = (this.db as any).workflowJob;
+    if (!jobModel) {
+      return {
+        queued: 0,
+        active: 0,
+        completed: 0,
+        failed: 0,
+        dead: 0,
+        running: this.queueWorker.runningWorkflowIds.size,
+        maxConcurrent: this.maxConcurrentExecutions,
+      };
+    }
+
+    const [queued, active, completed, failed, dead] = await Promise.all([
+      jobModel.count({ where: { status: 'QUEUED' } }),
+      jobModel.count({ where: { status: 'ACTIVE' } }),
+      jobModel.count({ where: { status: 'COMPLETED' } }),
+      jobModel.count({ where: { status: 'FAILED' } }),
+      jobModel.count({ where: { status: 'DEAD' } }),
+    ]);
+
+    return {
+      queued,
+      active,
+      completed,
+      failed,
+      dead,
+      running: this.queueWorker.runningWorkflowIds.size,
+      maxConcurrent: this.maxConcurrentExecutions,
+    };
+  }
+
+  private circuitBreakerFactory: ((name: string, opts: { failureThreshold: number; resetTimeoutMs: number }) => { call: <T>(fn: () => Promise<T>) => Promise<T> }) | undefined;
+  private creditServiceInstance: { reconcile: (params: Record<string, unknown>) => Promise<void> } | null = null;
+
+  /** Inject distributed circuit breaker factory for multi-instance safety. */
+  setCircuitBreakerFactory(factory: (name: string, opts: { failureThreshold: number; resetTimeoutMs: number }) => { call: <T>(fn: () => Promise<T>) => Promise<T> }): void {
+    this.circuitBreakerFactory = factory;
+  }
+
+  startQueueWorker(): void {
+    this.queueWorker.start();
+  }
+
+  stopQueueWorker(): void {
+    this.queueWorker.stop();
+  }
+
+  /** Graceful shutdown: stop polling and wait for in-flight jobs. */
+  async drainQueueWorker(): Promise<void> {
+    await this.queueWorker.drain();
+  }
+
+  /** Expose worker health for operator diagnostics. */
+  getWorkerHealth(): WorkerHealth {
+    return this.queueWorker.health();
+  }
+
+  /**
+   * Persist a durable job row keyed by workflowId. Accepts any payload shape carrying at
+   * minimum { workflowId, tenantId, userId } — the rest of the object is stored verbatim
+   * in payloadJson and interpreted by the processor (via the `action` discriminator).
+   */
+  private async upsertWorkflowJob(
+    params: { workflowId: string; tenantId: string; userId: string } & Record<string, unknown>,
+  ): Promise<void> {
+    const jobModel = (this.db as any).workflowJob;
+    if (!jobModel) {
+      this.log.warn({ workflowId: params.workflowId }, '[SwarmQueue] workflow_jobs model unavailable; executing immediately');
+      // Fallback path only runs for execution jobs (no action, or action='execute').
+      const actionField = (params as Record<string, unknown>)['action'];
+      const action = typeof actionField === 'string' ? actionField : 'execute';
+      if (action === 'execute') {
+        void this.executeAsync(params as unknown as ExecuteAsyncParams);
+      } else {
+        this.log.warn(
+          { workflowId: params.workflowId, action },
+          '[SwarmQueue] Control action dropped — workflow_jobs model unavailable',
+        );
+      }
+      return;
+    }
+
+    const payload = params as unknown as Record<string, unknown>;
+    const actionField = payload['action'];
+    const action = typeof actionField === 'string' ? actionField : 'execute';
+    const existing = await jobModel.findUnique({ where: { workflowId: params.workflowId } });
+    if (existing) {
+      if (existing.status === 'COMPLETED' && action === 'execute') {
+        this.log.warn({ workflowId: params.workflowId }, '[SwarmQueue] Workflow already completed; enqueue ignored');
+        return;
+      }
+
+      await jobModel.update({
+        where: { workflowId: params.workflowId },
+        data: {
+          status: 'QUEUED',
+          payloadJson: payload,
+          availableAt: new Date(),
+          lastError: null,
+          completedAt: null,
+        },
+      });
+      return;
+    }
+
+    await jobModel.create({
+      data: {
+        workflowId: params.workflowId,
+        tenantId: params.tenantId,
+        userId: params.userId,
+        status: 'QUEUED',
+        attempts: 0,
+        maxAttempts: 5,
+        payloadJson: payload,
+        availableAt: new Date(),
+      },
+    });
+  }
+
+  /** Inject credit service for post-execution reconciliation. */
+  setCreditService(service: { reconcile: (params: Record<string, unknown>) => Promise<void> }): void {
+    this.creditServiceInstance = service;
+  }
+
+  /**
+   * Enable cross-instance SSE event relay via Redis pub/sub.
+   * When this is set, all .emit() calls also publish to a Redis channel,
+   * and events from other instances are re-emitted locally.
+   */
+  enableRedisRelay(publisherRedis: unknown, subscriberRedis: unknown): void {
+    this.redisPublisher = publisherRedis as SwarmExecutionService['redisPublisher'];
+
+    const sub = subscriberRedis as { subscribe: (ch: string) => Promise<unknown>; on: (event: string, fn: (...args: unknown[]) => void) => void };
+    sub.subscribe('jak:sse:events').catch((err: unknown) => {
+      this.log.warn({ err }, '[SSE relay] Failed to subscribe to Redis channel');
+    });
+
+    sub.on('message', (_channel: unknown, message: unknown) => {
+      try {
+        const parsed = JSON.parse(String(message)) as { eventName: string; data: unknown; sourceInstance: string };
+        // Only re-emit events from OTHER instances
+        if (parsed.sourceInstance !== this.instanceId) {
+          super.emit(parsed.eventName, parsed.data);
+        }
+      } catch {
+        // Malformed message
+      }
+    });
+
+    this.log.info('[SSE relay] Cross-instance event relay enabled via Redis');
+  }
+
+  /** Override emit to also publish to Redis for cross-instance SSE. */
+  override emit(eventName: string | symbol, ...args: unknown[]): boolean {
+    const result = super.emit(eventName, ...args);
+
+    // Publish to Redis for other instances (only for workflow/project events)
+    if (this.redisPublisher && typeof eventName === 'string' && (eventName.startsWith('workflow:') || eventName.startsWith('project:'))) {
+      this.redisPublisher.publish('jak:sse:events', JSON.stringify({
+        eventName,
+        data: args[0],
+        sourceInstance: this.instanceId,
+      })).catch(() => { /* Redis unavailable — local-only mode */ });
+    }
+
+    return result;
+  }
+
+  /**
+   * Launch swarm execution for a workflow. Intended to be called in the
+   * background (e.g. via setImmediate) so the HTTP request returns 202 before
+   * the swarm begins executing.
+   *
+   * Flow:
+   *   1. Mark workflow RUNNING
+   *   2. Run swarm graph
+   *   3. Persist all agent traces to DB
+   *   4. Persist any new approval requests to DB
+   *   5. Update workflow to final status
+   */
+  async executeAsync(params: ExecuteAsyncParams): Promise<void> {
+    const { workflowId, tenantId, userId, goal, industry } = params;
+
+    // ── Idempotency guard: prevent duplicate execution for the same request ──
+    if (params.idempotencyKey) {
+      const existing = await this.db.workflow.findUnique({
+        where: { id: workflowId },
+        select: { status: true, stateJson: true },
+      });
+      const existingState = (existing?.stateJson ?? {}) as Record<string, unknown>;
+      const existingIdemKey = (existingState['__checkpoint'] as Record<string, unknown> | undefined)?.['idempotencyKey'];
+      if (existingIdemKey === params.idempotencyKey && existing?.status === 'COMPLETED') {
+        this.log.info({ workflowId, idempotencyKey: params.idempotencyKey },
+          '[Swarm] Duplicate execution blocked by idempotency key — workflow already completed');
+        return;
+      }
+    }
+
+    // ── Distributed lock: prevent duplicate execution across instances ───
+    let lockToken: string | null = null;
+    if (this.lockProvider) {
+      lockToken = await this.lockProvider.acquire(`workflow:exec:${workflowId}`, 10 * 60 * 1000); // 10 min TTL
+      if (!lockToken) {
+        this.log.warn({ workflowId }, '[Swarm] Workflow already running on another instance — skipping');
+        return;
+      }
+    }
+
+    this.log.info(
+      {
+        workflowId,
+        tenantId,
+        executionEngine: config.executionEngine,
+        workflowRuntime: config.workflowRuntime,
+      },
+      '[Swarm] Starting async execution',
+    );
+
+    // Phase 7: JAK_EXECUTION_ENGINE=openai-first is now implemented via
+    // OpenAIRuntime in the agent runtime factory. Boot guard removed.
+    // Phase 6: JAK_WORKFLOW_RUNTIME=langgraph is implemented via
+    // LangGraphRuntime adapter. Both flags now route to real impls.
+
+    // ── Guardrail: injection detection ───────────────────────────────────
+    const shieldScan = await getShieldGateway().scanInput(goal, {
+      tenantId,
+      userId,
+      workflowId,
+      source: 'workflow_goal',
+    });
+    const injectionResult = shieldScan.injection;
+    if (injectionResult.detected && injectionResult.risk === 'HIGH') {
+      this.log.warn({ workflowId, patterns: injectionResult.patterns }, '[Guardrail] Injection attempt detected in goal');
+      void this.audit.log({
+        action: AuditAction.INJECTION_DETECTED,
+        tenantId,
+        userId,
+        resource: 'workflow',
+        resourceId: workflowId,
+        details: { patterns: injectionResult.patterns, confidence: injectionResult.confidence },
+      });
+      await this.workflowService.updateWorkflowStatus(
+        workflowId,
+        'FAILED',
+        'Goal rejected: potential prompt injection detected.',
+      );
+      this.emit(`workflow:${workflowId}`, { type: 'failed', workflowId, error: 'Goal rejected: potential prompt injection detected.', timestamp: new Date().toISOString() });
+      return;
+    }
+
+    // ── Guardrail: PII detection ─────────────────────────────────────────
+    const piiResult = shieldScan.pii;
+    if (piiResult.containsPII) {
+      this.log.warn({ workflowId, piiTypes: piiResult.found }, '[Guardrail] PII detected in goal');
+      void this.audit.log({
+        action: AuditAction.PII_DETECTED,
+        tenantId,
+        userId,
+        resource: 'workflow',
+        resourceId: workflowId,
+        details: { types: piiResult.found },
+      });
+    }
+
+    try {
+      await this.workflowService.updateWorkflowStatus(workflowId, 'RUNNING');
+
+      // Hardening pass — emit canonical lifecycle 'created' + 'started'
+      // events. Both the SSE cockpit AND the audit log get them through
+      // emitLifecycle. Replaces the previous bare emit + manual audit.log
+      // pair so we never drift in two directions.
+      const nowIso = new Date().toISOString();
+      this.emitLifecycle({ type: 'created', workflowId, tenantId, userId, goal, timestamp: nowIso }, tenantId, userId);
+      this.emitLifecycle({ type: 'started', workflowId, runtime: this.workflowRuntime.name, timestamp: nowIso }, tenantId, userId);
+      // Keep the legacy 'started' SSE event for the old cockpit code that
+      // doesn't yet read the lifecycle envelope.
+      this.emit(`workflow:${workflowId}`, { type: 'started', workflowId, timestamp: nowIso });
+
+      // Publish to supervisor bus for cross-cutting coordination
+      supervisorBus.publish('workflow:started', {
+        type: 'workflow:started',
+        tenantId,
+        workflowId,
+      });
+
+      const tenant = await this.db.tenant.findUnique({ where: { id: tenantId } });
+      const effectiveIndustry = (industry ?? tenant?.industry ?? Industry.GENERAL) as Industry;
+      const industryPack = getIndustryPack(effectiveIndustry);
+
+      // ── CEO Super-Orchestrator pre-flight (final-hardening Gap A) ───
+      // Detects CEO mode (explicit or auto-from-goal-text), loads Company
+      // Brain, and emits ceo_* lifecycle events BEFORE the workflow
+      // runtime starts. Pre-flight result is used to drive an executive-
+      // summary generation after the workflow completes.
+      const ceoOrchestrator = new CEOOrchestratorService(this.db, this.log);
+      const ceoOnLifecycle = (ev: WorkflowLifecycleEvent) =>
+        this.emitLifecycle(ev, tenantId, userId);
+      let ceoPreFlight: CEOPreFlightResult | undefined;
+      try {
+        ceoPreFlight = await ceoOrchestrator.preFlight(
+          {
+            workflowId,
+            tenantId,
+            userId,
+            goal,
+            industry: effectiveIndustry,
+            onLifecycle: ceoOnLifecycle,
+          },
+          {
+            ...(params.ceoMode === 'ceo' ? { explicitMode: 'ceo' as const } : {}),
+          },
+        );
+      } catch (ceoErr) {
+        // CEO pre-flight failure must NEVER block the workflow. The
+        // log captures the error; the workflow proceeds without CEO
+        // wrapping.
+        this.log.warn(
+          { workflowId, err: ceoErr instanceof Error ? ceoErr.message : String(ceoErr) },
+          '[Swarm] CEO pre-flight failed; proceeding without CEO wrapping',
+        );
+      }
+      // Force-off when caller passed ceoMode='standard'.
+      if (params.ceoMode === 'standard' && ceoPreFlight) {
+        ceoPreFlight = { ...ceoPreFlight, isCEOMode: false };
+      }
+      const connectedIntegrations = await this.db.integration.findMany({
+        where: { tenantId, status: 'CONNECTED' },
+        select: { provider: true },
+      });
+      const connectedProviders = connectedIntegrations.map((i) => i.provider).filter((p): p is string => Boolean(p));
+
+      const user = await this.db.user.findUnique({ where: { id: userId }, select: { role: true } });
+
+      // ─── Per-tenant LLM provider preference ────────────────────────────────
+      // Read from TenantMemory (key: llm:preferred_provider). If set,
+      // also read and decrypt the API key for that provider from
+      // TenantMemory (key: llm:{provider}:api_key). Both are passed
+      // through to the runner via RunParams and the llm-key-registry
+      // side-channel respectively.
+      let llmProvider: 'openai' | 'gemini' | undefined;
+      let llmApiKey: string | undefined;
+      try {
+        const prefEntry = await this.db.tenantMemory.findFirst({
+          where: { tenantId, key: 'llm:preferred_provider', memoryType: 'POLICY' },
+        });
+        if (prefEntry) {
+          const prefValue = prefEntry.value as { provider?: string };
+          if (prefValue.provider === 'openai' || prefValue.provider === 'gemini') {
+            llmProvider = prefValue.provider;
+          }
+        }
+        if (llmProvider) {
+          const apiKeyEntry = await this.db.tenantMemory.findFirst({
+            where: { tenantId, key: `llm:${llmProvider}:api_key`, memoryType: 'POLICY' },
+          });
+          if (apiKeyEntry) {
+            const { decryptLLMKey } = await import('../utils/llm-key-crypto.js');
+            llmApiKey = decryptLLMKey((apiKeyEntry.value as { encryptedKey: string }).encryptedKey);
+          }
+        }
+      } catch (llmPrefErr) {
+        // TenantMemory read/decrypt failure must not block the workflow.
+        // Fall back to env-var default.
+        this.log.warn(
+          { tenantId, err: llmPrefErr instanceof Error ? llmPrefErr.message : String(llmPrefErr) },
+          '[Swarm] Failed to read tenant LLM preference; using env-var default',
+        );
+      }
+
+      // Load conversation thread history when this workflow belongs to a
+      // conversation. This replaces the frontend goal-string concatenation
+      // hack with real server-side memory across graph replays.
+      let conversationHistory: Array<{ role: string; content: string }> | undefined;
+      if (params.conversationId) {
+        const messages = await this.db.conversationMessage.findMany({
+          where: { conversationId: params.conversationId },
+          orderBy: { createdAt: 'asc' },
+          select: { role: true, content: true },
+        });
+        if (messages.length > 0) {
+          conversationHistory = messages.map((m) => ({ role: m.role, content: m.content }));
+        }
+      }
+
+      // ── CEO mode with no connected data sources ──────────────────────────
+      // When CEO mode is active and there are no connected integrations,
+      // augment the goal so the planner produces a template/outline rather
+      // than fabricating metrics from empty context.
+      let effectiveGoal = goal;
+      if (ceoPreFlight?.isCEOMode && connectedProviders.length === 0) {
+        effectiveGoal = `${goal}\n\n[System note: No company data sources are connected. Produce a structured template or outline summary that highlights what data sources would be needed for a complete analysis. Do not fabricate metrics.]`;
+      }
+
+      // ── Execute workflow (ADK or LangGraph) ────────────────────────────────
+      // JAK_ADK_MODE=1 routes through @google/adk orchestration (satisfies
+      // Google Agents Challenge). Falls back to LangGraph on ADK error or
+      // when the flag is not set. Both paths produce the same SwarmResult shape.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let result: SwarmResult | undefined;
+
+      if (process.env['JAK_ADK_MODE']?.trim() === '1') {
+        try {
+          const { runWithAdk } = await import('@jak-swarm/adk');
+          const { toolRegistry } = await import('@jak-swarm/tools');
+          const jakToolMetadata = toolRegistry.list();
+          const adkResult = await runWithAdk({
+            workflowId,
+            goal: effectiveGoal,
+            tenantId,
+            userId,
+            provider: llmProvider ?? 'gemini',
+            jakToolMetadata,
+            toolContext: {
+              tenantId,
+              userId,
+              workflowId,
+              runId: `adk_${workflowId}`,
+            },
+            workerRoles: params.roleModes?.length ? params.roleModes : undefined,
+            googleSearchGrounding: process.env['GEMINI_GOOGLE_SEARCH_GROUNDING']?.trim() === '1' || true,
+            openaiWebSearch: process.env['OPENAI_WEB_SEARCH']?.trim() === '1',
+          });
+
+          result = {
+            workflowId,
+            status: adkResult.success ? WorkflowStatus.COMPLETED : WorkflowStatus.FAILED,
+            outputs: adkResult.state.outputs ?? [],
+            traces: (adkResult.state.traces ?? []) as SharedAgentTrace[],
+            pendingApprovals: [],
+            clarificationNeeded: false,
+            ...(adkResult.error ? { error: adkResult.error } : {}),
+            durationMs: 0,
+            startedAt: new Date(),
+            completedAt: new Date(),
+          } as any;
+
+          this.log.info({ workflowId, provider: llmProvider ?? 'gemini', mode: 'adk' },
+            '[Swarm] Workflow completed via ADK orchestration');
+        } catch (adkErr) {
+          this.log.error({ workflowId, err: adkErr instanceof Error ? adkErr.message : String(adkErr) },
+            '[Swarm] ADK mode failed; falling back to LangGraph');
+        }
+      }
+
+      // Fallback to LangGraph when ADK is not enabled or failed
+      if (!result) {
+      result = await this.runner.run({
+        workflowId,
+        tenantId,
+        userId,
+        goal: effectiveGoal,
+        industry: effectiveIndustry,
+        roleModes: params.roleModes,
+        maxCostUsd: params.maxCostUsd,
+        idempotencyKey: params.idempotencyKey,
+        subscriptionTier: params.subscriptionTier,
+        userRole: user?.role ?? undefined,
+        ...(conversationHistory ? { conversationHistory } : {}),
+        ...(this.circuitBreakerFactory ? { circuitBreakerFactory: this.circuitBreakerFactory } : {}),
+        ...(llmProvider ? { llmProvider } : {}),
+        ...(llmApiKey ? { llmApiKey } : {}),
+        // Google grounding config (Gemini-only; read from env vars per-tenant future)
+        ...(process.env['GEMINI_GOOGLE_SEARCH_GROUNDING']?.trim() === '1' ? { googleSearchGrounding: true } : {}),
+        ...(process.env['GEMINI_VERTEX_AI_SEARCH_DATASTORE']?.trim() ? { vertexAISearchDatastore: process.env['GEMINI_VERTEX_AI_SEARCH_DATASTORE'].trim() } : {}),
+        // OpenAI web_search hosted tool (native search without Serper/Tavily)
+        ...(process.env['OPENAI_WEB_SEARCH']?.trim() === '1' ? { openaiWebSearch: true } : {}),
+        onStateChange: async (wfId: string, stateData: unknown) => {
+          try {
+            const s = stateData as Record<string, unknown>;
+            const normalizedStatus = mapSwarmStatusToDb(String(s.status ?? 'RUNNING'));
+            const replaySafety = classifyReplaySafety(s);
+            // Defense in depth: strip any non-JSON-serializable values (functions,
+            // symbols, circular refs) before writing state to Prisma. The
+            // breaker-registry side-channel should already prevent functions
+            // from landing in state, but any future rogue field would crash
+            // `prisma.workflow.update` with `[object Function]`.
+            const safeState = stripNonSerializable(s) as Record<string, unknown>;
+            const checkpoint = {
+              ...safeState,
+              __checkpoint: {
+                version: 2,
+                checkpointAt: new Date().toISOString(),
+                replaySafety: replaySafety.safety,
+                replayReason: replaySafety.reason,
+                replayTaskId: replaySafety.taskId,
+                idempotencyKey: params.idempotencyKey ?? null,
+                instanceId: this.instanceId,
+              },
+            };
+            await (this.db.workflow.update as any)({
+              where: { id: wfId },
+              data: {
+                stateJson: checkpoint,
+                status: normalizedStatus,
+                totalCostUsd: (s.accumulatedCostUsd as number) ?? 0,
+              },
+            });
+          } catch (stateErr) {
+            this.log.error({ workflowId: wfId, err: stateErr instanceof Error ? stateErr.message : String(stateErr) },
+              '[Swarm] CRITICAL: Failed to persist workflow state — state may be lost on restart');
+          }
+        },
+        // Approval auto-bypass is now opt-in. Tenants must explicitly set
+        // `autoApproveEnabled = true` AND `approvalThreshold` for risk-below-
+        // threshold tasks to skip human review. Default false keeps the gate
+        // blocking, matching the landing-page claim of human approval on high-risk
+        // actions.
+        autoApproveEnabled: Boolean((tenant as any)?.autoApproveEnabled),
+        approvalThreshold: (tenant as any)?.approvalThreshold ?? undefined,
+        allowedDomains: (tenant as any)?.allowedDomains ?? [],
+        browserAutomationEnabled: Boolean((tenant as any)?.enableBrowserAutomation),
+        restrictedCategories: industryPack.restrictedTools,
+        // Merge tenant-admin disabled tools (at-admin blocklist) with
+        // industry-pack per-name blocks (compliance-driven blocklist)
+        // and the per-run StandingOrder blocklist (Item C). All three
+        // go into TenantToolRegistry.disabledToolNames — at isAllowed()
+        // time a tool blocked by ANY source is rejected.
+        disabledToolNames: [
+          ...(tenant?.disabledToolNames ?? []),
+          ...(industryPack.restrictedToolNames ?? []),
+          ...(params.disabledToolNames ?? []),
+        ],
+        // Item C — StandingOrder allowedTools whitelist. Non-empty =
+        // strict whitelist enforced by TenantToolRegistry.isAllowed.
+        allowedToolNames: params.allowedToolNames ?? [],
+        connectedProviders,
+        onAgentActivity: (data: unknown) => {
+          this.emit(`workflow:${workflowId}`, data);
+          // Hardening pass — translate fine-grained agent events into the
+          // canonical workflow lifecycle vocabulary so the audit log
+          // captures step_started / step_completed / step_failed / planned
+          // without the runner needing to know about audit at all.
+          const ev = data as Record<string, unknown> | undefined;
+          if (!ev || typeof ev !== 'object') return;
+          const t = ev['type'] as string | undefined;
+          const nowIso = new Date().toISOString();
+          if (t === 'plan_created') {
+            const plan = ev['plan'] as { tasks?: unknown[] } | undefined;
+            this.emitLifecycle({
+              type: 'planned',
+              workflowId,
+              planId: ((ev['planId'] as string) ?? `${workflowId}-plan`),
+              taskCount: Array.isArray(plan?.tasks) ? plan!.tasks!.length : 0,
+              timestamp: nowIso,
+            }, tenantId, userId);
+          } else if (t === 'worker_started') {
+            this.emitLifecycle({
+              type: 'step_started',
+              workflowId,
+              stepId: (ev['taskName'] as string) ?? (ev['agentRole'] as string) ?? 'step',
+              agentRole: (ev['agentRole'] as string) ?? 'UNKNOWN',
+              timestamp: nowIso,
+            }, tenantId, userId);
+          } else if (t === 'worker_completed') {
+            const success = ev['success'] !== false;
+            this.emitLifecycle(success ? {
+              type: 'step_completed',
+              workflowId,
+              stepId: (ev['taskName'] as string) ?? (ev['agentRole'] as string) ?? 'step',
+              agentRole: (ev['agentRole'] as string) ?? 'UNKNOWN',
+              durationMs: (ev['durationMs'] as number) ?? 0,
+              timestamp: nowIso,
+            } : {
+              type: 'step_failed',
+              workflowId,
+              stepId: (ev['taskName'] as string) ?? (ev['agentRole'] as string) ?? 'step',
+              agentRole: (ev['agentRole'] as string) ?? 'UNKNOWN',
+              error: (ev['error'] as string) ?? 'unknown',
+              durationMs: (ev['durationMs'] as number) ?? 0,
+              timestamp: nowIso,
+            }, tenantId, userId);
+          } else if (t === 'agent_assigned') {
+            // Sprint 2.1 / Item K — Router emitted one of these per
+            // (taskId → agentRole) mapping. Translate to workflow lifecycle.
+            this.emitLifecycle({
+              type: 'agent_assigned',
+              workflowId,
+              stepId: (ev['taskName'] as string) ?? (ev['taskId'] as string) ?? 'task',
+              agentRole: (ev['agentRole'] as string) ?? 'UNKNOWN',
+              ...(typeof ev['routingReason'] === 'string' ? { routingReason: ev['routingReason'] as string } : {}),
+              timestamp: nowIso,
+            }, tenantId, userId);
+          } else if (t === 'verification_started') {
+            this.emitLifecycle({
+              type: 'verification_started',
+              workflowId,
+              ...(typeof ev['taskName'] === 'string' || typeof ev['taskId'] === 'string'
+                ? { stepId: (ev['taskName'] as string) ?? (ev['taskId'] as string) }
+                : {}),
+              timestamp: nowIso,
+            }, tenantId, userId);
+          } else if (t === 'verification_completed') {
+            this.emitLifecycle({
+              type: 'verification_completed',
+              workflowId,
+              ...(typeof ev['taskName'] === 'string' || typeof ev['taskId'] === 'string'
+                ? { stepId: (ev['taskName'] as string) ?? (ev['taskId'] as string) }
+                : {}),
+              passed: ev['passed'] === true,
+              ...(typeof ev['groundingScore'] === 'number' ? { groundingScore: ev['groundingScore'] as number } : {}),
+              timestamp: nowIso,
+            }, tenantId, userId);
+          } else if (t === 'context_summarized') {
+            // Sprint 2.2 / Item H — long-DAG state compression event.
+            const stepId = (typeof ev['taskName'] === 'string' && ev['taskName']) ||
+              (typeof ev['taskId'] === 'string' ? (ev['taskId'] as string) : '');
+            this.emitLifecycle({
+              type: 'context_summarized',
+              workflowId,
+              stepId,
+              inputTaskResultCount: typeof ev['inputTaskResultCount'] === 'number' ? (ev['inputTaskResultCount'] as number) : 0,
+              tokensBefore: typeof ev['estimatedTokensBefore'] === 'number' ? (ev['estimatedTokensBefore'] as number) : 0,
+              tokensAfter: typeof ev['estimatedTokensAfter'] === 'number' ? (ev['estimatedTokensAfter'] as number) : 0,
+              timestamp: nowIso,
+            }, tenantId, userId);
+          } else if (t === 'tool_approval_required') {
+            // Phase 2 (full-fledged JAK) — close the loop:
+            // BaseAgent emitted this when ToolRegistry.execute returned
+            // outcome:'approval_required'. Persist a real ApprovalRequest
+            // row + emit the canonical lifecycle 'approval_required'
+            // event so the cockpit's existing inbox UI surfaces it.
+            // The user's decision flows through /approvals/:id/decide
+            // and the WorkflowService.resolveApproval pipeline.
+            const toolName = String(ev['toolName'] ?? 'unknown_tool');
+            const category = String(ev['category'] ?? 'WRITE');
+            const reason = String(ev['reason'] ?? 'Approval required.');
+            const inputSummary = String(ev['inputSummary'] ?? '');
+            // Treat per-tool gates as HIGH risk by default for the audit
+            // trail; the actual category drives the approval card copy.
+            const riskLevel =
+              category === 'DESTRUCTIVE'
+                ? 'CRITICAL'
+                : category === 'EXTERNAL_POST' || category === 'CREDENTIAL' || category === 'INSTALL'
+                  ? 'HIGH'
+                  : 'MEDIUM';
+            // Best-effort persist. If the DB call fails we log + continue
+            // — the cockpit still gets the lifecycle event below so the
+            // user sees the gate fired even when persistence is briefly
+            // unavailable.
+            void this.workflowService
+              .createApprovalRequest({
+                workflowId,
+                tenantId,
+                taskId: (ev['agentRole'] as string) ?? 'tool_call',
+                agentRole: (ev['agentRole'] as string) ?? 'UNKNOWN',
+                action: `tool:${toolName}`,
+                rationale: reason,
+                riskLevel,
+                proposedDataJson: { toolName, category, inputSummary },
+                toolName,
+                ...(category === 'EXTERNAL_POST' ? { externalService: toolName } : {}),
+              })
+              .then((approval) => {
+                this.emitLifecycle(
+                  {
+                    type: 'approval_required',
+                    workflowId,
+                    approvalId: approval.id,
+                    riskLevel,
+                    timestamp: nowIso,
+                  },
+                  tenantId,
+                  userId,
+                );
+              })
+              .catch((approvalErr) => {
+                this.log.warn(
+                  { workflowId, toolName, err: approvalErr },
+                  '[Swarm] Failed to persist tool_approval_required ApprovalRequest (non-fatal)',
+                );
+              });
+          }
+        },
+      });
+      } // end if (!result) — ADK fallback block
+
+      await this.persistTraces(result!, tenantId, workflowId);
+      await this.persistApprovals(result, tenantId, workflowId);
+
+      // Migration 16 — emit intent_detected, persist IntentRecord, emit
+      // company_context_missing when required CompanyProfile fields aren't
+      // approved. Best-effort; never blocks the workflow.
+      try {
+        await this.persistIntentAndContext({
+          workflowId,
+          tenantId,
+          userId,
+          goal,
+          result: result as { missionBrief?: { intent?: string; intentConfidence?: number | null; subFunction?: string; urgency?: number; riskIndicators?: string[]; requiredOutputs?: string[]; clarificationNeeded?: boolean; clarificationQuestion?: string }; directAnswer?: string },
+        });
+      } catch (intentErr) {
+        this.log.warn(
+          { workflowId, err: intentErr instanceof Error ? intentErr.message : String(intentErr) },
+          '[intent] persistence failed (non-fatal)',
+        );
+      }
+
+      // Compile and save final output
+      let directAnswerOverride: string | undefined;
+      try {
+        // Short-circuit #1: result.directAnswer set by commander-node when
+        // the graph routes to __end__ on a trivial input. Use verbatim.
+        const directAnswer = (result as { directAnswer?: string }).directAnswer;
+        const clarificationQuestion = result.clarificationNeeded
+          ? (typeof result.clarificationQuestion === 'string' ? result.clarificationQuestion.trim() : '')
+          : '';
+        const clarificationFromOutputs = result.clarificationNeeded
+          ? (() => {
+              const first = result.outputs[0];
+              return typeof first === 'string' ? first.trim() : '';
+            })()
+          : '';
+        let finalOutput: string;
+        if (typeof directAnswer === 'string' && directAnswer.trim().length > 0) {
+          finalOutput = directAnswer.trim();
+          directAnswerOverride = finalOutput;
+        } else if (clarificationQuestion.length > 0 || clarificationFromOutputs.length > 0) {
+          // Short-circuit #2: clarification workflows should always return a
+          // user-visible question, even if traces are absent or stale.
+          finalOutput = clarificationQuestion.length > 0 ? clarificationQuestion : clarificationFromOutputs;
+        } else {
+          // Prefer in-memory traces from the runner over a second DB round-trip.
+          // This defends against silent persistence gaps (e.g. one trace
+          // failing to write) while still producing a useful finalOutput.
+          const traceRecords = result.traces.map((t: { agentRole: string | unknown; output: unknown; stepIndex: number }) => ({
+            agentRole: String(t.agentRole),
+            outputJson: t.output,
+            stepIndex: t.stepIndex,
+          }));
+
+          // Short-circuit #2 (defensive): even when the graph DIDN'T route
+          // to __end__ — e.g. because a stale @jak-swarm/swarm dist on the
+          // worker is missing the directAnswer routing in commander-node.ts
+          // — the Commander's persisted trace will still contain
+          // outputJson.directAnswer. Surface it here so a perfectly-good
+          // greeting/factual answer isn't lost to a deploy-cache hiccup.
+          // This also makes the API resilient to any future graph-routing
+          // regression around Commander short-circuit semantics.
+          const commanderTrace = traceRecords.find((t) => t.agentRole === 'COMMANDER');
+          const commanderOut = commanderTrace?.outputJson as { directAnswer?: unknown } | null | undefined;
+          const traceDirectAnswer = typeof commanderOut?.directAnswer === 'string'
+            ? (commanderOut.directAnswer as string).trim()
+            : '';
+          if (traceDirectAnswer.length > 0) {
+            finalOutput = traceDirectAnswer;
+            directAnswerOverride = finalOutput;
+          } else {
+            // Short-circuit #3: recover clarifications embedded in the
+            // commander trace before falling back to worker-output compile.
+            const traceClarification = typeof (commanderOut as { clarificationQuestion?: unknown } | null | undefined)?.clarificationQuestion === 'string'
+              ? String((commanderOut as { clarificationQuestion?: unknown }).clarificationQuestion).trim()
+              : '';
+            if (traceClarification.length > 0) {
+              finalOutput = traceClarification;
+            } else {
+            finalOutput = this.compileFinalOutput(traceRecords);
+            }
+          }
+        }
+        await (this.db.workflow.update as any)({
+          where: { id: workflowId },
+          data: { finalOutput },
+        });
+
+        // Persist assistant response into the conversation thread so
+        // subsequent turns have full memory.
+        if (params.conversationId && finalOutput) {
+          await this.db.conversationMessage.create({
+            data: {
+              conversationId: params.conversationId,
+              workflowId,
+              role: 'assistant',
+              content: finalOutput,
+            },
+          }).catch((err) => {
+            this.log.warn({ workflowId, err: err instanceof Error ? err.message : String(err) }, '[Swarm] Failed to persist assistant message to conversation');
+          });
+        }
+      } catch (outErr) {
+        this.log.warn({ workflowId, err: outErr instanceof Error ? outErr.message : String(outErr) },
+          '[Swarm] Failed to persist final output');
+      }
+
+      const dbStatus = directAnswerOverride
+        ? 'COMPLETED' // a recovered direct answer means the workflow is effectively done
+        : mapSwarmStatusToDb(result.status);
+      const traceError = result.traces.find((t: { error?: string }) => t.error)?.error;
+      const errorMessage = result.error
+        ?? traceError
+        ?? (dbStatus === 'FAILED'
+          ? 'Workflow failed without error details. Check traces for the failing node.'
+          : undefined);
+      await this.workflowService.updateWorkflowStatus(workflowId, dbStatus, errorMessage);
+
+      if (dbStatus === 'COMPLETED') {
+        // Lifecycle 'completed' — single emitter does both SSE + audit.
+        this.emitLifecycle({
+          type: 'completed',
+          workflowId,
+          finalStatus: 'COMPLETED' as never,
+          durationMs: result.durationMs,
+          timestamp: new Date().toISOString(),
+        }, tenantId, userId);
+        // Keep legacy SSE event for older cockpit code.
+        this.emit(`workflow:${workflowId}`, { type: 'completed', workflowId, status: dbStatus, timestamp: new Date().toISOString() });
+
+        // ── CEO Super-Orchestrator post-flight (final-hardening Gap A) ──
+        // When CEO mode was detected during pre-flight, generate the
+        // executive summary and emit ceo_final_summary_generated. Skipped
+        // when not in CEO mode (no extra LLM cost for normal workflows).
+        if (ceoPreFlight?.isCEOMode) {
+          try {
+            await ceoOrchestrator.generateExecutiveSummary(
+              {
+                workflowId,
+                tenantId,
+                goal,
+                intent: ceoPreFlight.intent,
+                executiveFunctions: ceoPreFlight.executiveFunctions,
+                outputs: result.outputs,
+                status: 'COMPLETED',
+                durationMs: result.durationMs,
+              },
+              ceoOnLifecycle,
+            );
+          } catch (summaryErr) {
+            this.log.warn(
+              { workflowId, err: summaryErr instanceof Error ? summaryErr.message : String(summaryErr) },
+              '[Swarm] CEO summary generation threw; workflow already completed',
+            );
+          }
+        }
+      } else if (dbStatus === 'FAILED') {
+        this.emitLifecycle({
+          type: 'failed',
+          workflowId,
+          error: errorMessage ?? 'unknown',
+          durationMs: result.durationMs,
+          timestamp: new Date().toISOString(),
+        }, tenantId, userId);
+        this.emit(`workflow:${workflowId}`, { type: 'failed', workflowId, error: errorMessage, timestamp: new Date().toISOString() });
+      } else if (dbStatus === 'PAUSED') {
+        // Hardening pass: previously the SSE stream went silent when the
+        // approval-node halted the workflow — the cockpit never saw a
+        // 'paused' event, so the user believed the run was stuck. Emit
+        // the same shape the manual /pause route emits so ChatWorkspace
+        // flips the cockpit status badge to AWAITING_APPROVAL and
+        // surfaces the approval link.
+        const pendingApprovals = (result.pendingApprovals as SharedApprovalRequest[] | undefined) ?? [];
+        const pendingIds = pendingApprovals.map(a => a.id);
+        // One lifecycle 'approval_required' per pending approval — keeps
+        // the audit trail granular per request.
+        for (const a of pendingApprovals) {
+          this.emitLifecycle({
+            type: 'approval_required',
+            workflowId,
+            approvalId: a.id,
+            riskLevel: a.riskLevel,
+            timestamp: new Date().toISOString(),
+          }, tenantId, userId);
+        }
+        // Item B (OpenClaw-inspired Phase 1): the cockpit's inline approval
+        // card needs the SPECIFIC tool / files / external service / expected
+        // result that the reviewer is binding their decision to. Surface
+        // them on the same `paused` event the cockpit already consumes —
+        // pulling from the FIRST pending approval (the one the workflow is
+        // blocked on right now). Keeps the legacy event shape additive: old
+        // clients ignore the extra fields.
+        const primary = pendingApprovals[0];
+        this.emit(`workflow:${workflowId}`, {
+          type: 'paused',
+          workflowId,
+          reason: 'awaiting_approval',
+          pendingApprovalIds: pendingIds,
+          timestamp: new Date().toISOString(),
+          ...(primary?.id ? { approvalId: primary.id } : {}),
+          ...(primary?.action ? { taskName: primary.action } : {}),
+          ...(primary?.toolName ? { toolName: primary.toolName } : {}),
+          ...(primary?.filesAffected && primary.filesAffected.length > 0
+            ? { filesAffected: primary.filesAffected }
+            : {}),
+          ...(primary?.externalService ? { externalService: primary.externalService } : {}),
+          ...(primary?.expectedResult ? { expectedResult: primary.expectedResult } : {}),
+          ...(primary?.proposedDataHash ? { proposedDataHash: primary.proposedDataHash } : {}),
+        });
+      }
+
+      // Publish completion to supervisor bus
+      supervisorBus.publish('workflow:completed', {
+        type: 'workflow:completed',
+        tenantId,
+        workflowId,
+        status: dbStatus,
+        durationMs: result.durationMs,
+        taskCount: result.traces.length,
+        failedCount: result.traces.filter(t => t.error).length,
+      });
+
+      // ── Credit reconciliation: record actual usage to ledger ──────────
+      if (this.creditServiceInstance) {
+        try {
+          const actualCostUsd = result.traces.reduce((sum: number, t: { costUsd?: number }) =>
+            sum + (typeof t.costUsd === 'number' ? t.costUsd : 0), 0);
+          const actualCredits = Math.max(1, Math.ceil(actualCostUsd * 100));
+          const totalTokens = result.traces.reduce((sum: number, t: { tokenUsage?: { totalTokens?: number } }) =>
+            sum + (t.tokenUsage?.totalTokens ?? 0), 0);
+
+          await this.creditServiceInstance.reconcile({
+            tenantId,
+            userId,
+            workflowId,
+            taskType: 'agent_workflow',
+            modelUsed: 'mixed',
+            provider: 'mixed',
+            inputTokens: Math.round(totalTokens * 0.6),
+            outputTokens: Math.round(totalTokens * 0.4),
+            actualCredits,
+            reservedCredits: actualCredits, // Best estimate; real reservation tracked upstream
+            usdCost: actualCostUsd,
+            latencyMs: result.durationMs,
+            status: dbStatus === 'COMPLETED' ? 'completed' : 'failed',
+          });
+          this.log.debug({ workflowId, actualCredits, actualCostUsd }, '[billing] Workflow usage reconciled');
+        } catch (reconcileErr) {
+          this.log.warn({ workflowId, err: reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr) },
+            '[billing] Credit reconciliation failed');
+        }
+      }
+
+      this.log.info(
+        { workflowId, dbStatus, durationMs: result.durationMs, traces: result.traces.length },
+        '[Swarm] Execution completed',
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.error({ workflowId, err: message }, '[Swarm] Execution threw unexpected error');
+      this.emit(`workflow:${workflowId}`, { type: 'failed', workflowId, error: message, timestamp: new Date().toISOString() });
+      try {
+        await this.workflowService.updateWorkflowStatus(workflowId, 'FAILED', message);
+      } catch (dbErr) {
+        this.log.error({ workflowId, dbErr }, '[Swarm] Failed to mark workflow FAILED after error');
+      }
+    } finally {
+      // ── Release distributed lock ──────────────────────────────────────
+      if (this.lockProvider && lockToken) {
+        await this.lockProvider.release(`workflow:exec:${workflowId}`, lockToken).catch((relErr) => {
+          this.log.warn({ workflowId, err: relErr }, '[Swarm] Failed to release workflow lock (will expire via TTL)');
+        });
+      }
+    }
+  }
+
+  /**
+   * Execute the Vibe Coder workflow (Architect → Generator → Build-check →
+   * Debugger ↻ → Deployer) as the processor for a queued job whose payload
+   * carries `workflowKind: 'vibe-coder'`.
+   *
+   * Persists workflow status + the final result (files, deployment URL,
+   * build logs) to the workflow DB row. Emits SSE events so the builder UI
+   * can render progress live.
+   */
+  async executeVibeCoderAsync(params: ExecuteAsyncParams): Promise<void> {
+    const { workflowId, tenantId, userId, subscriptionTier, vibeCoderInput } = params;
+
+    if (!vibeCoderInput || !vibeCoderInput.description) {
+      this.log.error(
+        { workflowId },
+        '[VibeCoder] Missing vibeCoderInput or description in payload',
+      );
+      await this.workflowService.updateWorkflowStatus(
+        workflowId,
+        'FAILED',
+        'Missing vibe-coder input payload',
+      );
+      return;
+    }
+
+    this.log.info(
+      { workflowId, tenantId, framework: vibeCoderInput.framework },
+      '[VibeCoder] Starting workflow',
+    );
+
+    await this.workflowService.updateWorkflowStatus(workflowId, 'RUNNING');
+
+    const { runVibeCoderWorkflow } = await import('@jak-swarm/swarm');
+
+    // Lazy-import the checkpoint and project services so swarm-execution can
+    // stay agnostic to builder-specific concerns when no projectId is given.
+    const { CheckpointService } = await import('./checkpoint.service.js');
+    const { ProjectService } = await import('./project.service.js');
+    const projectId = vibeCoderInput.projectId;
+    const checkpointService = projectId ? new CheckpointService(this.db, this.log) : null;
+    const projectService = projectId ? new ProjectService(this.db, this.log) : null;
+
+    try {
+      const result = await runVibeCoderWorkflow({
+        workflowId,
+        tenantId,
+        userId,
+        subscriptionTier,
+        description: vibeCoderInput.description,
+        framework: vibeCoderInput.framework,
+        features: vibeCoderInput.features,
+        existingFiles: vibeCoderInput.existingFiles,
+        projectName: vibeCoderInput.projectName,
+        envVars: vibeCoderInput.envVars,
+        deployAfterBuild: vibeCoderInput.deployAfterBuild ?? true,
+        maxDebugRetries: vibeCoderInput.maxDebugRetries ?? 3,
+        onProgress: (event) => {
+          // Relay progress to SSE subscribers listening on /workflows/:id/stream.
+          this.emit(`workflow:${workflowId}`, {
+            type: 'vibe_coder:progress',
+            workflowId,
+            event: event.type,
+            data: event.data,
+            timestamp: event.timestamp,
+          });
+        },
+        onCheckpoint: projectId && checkpointService && projectService
+          ? async (stage, ctx) => {
+              // Persist the current file set to the project, then snapshot it.
+              // Both steps are best-effort — the vibe-coder workflow already
+              // swallows checkpoint errors, but we still log here for the
+              // operator's audit trail.
+              try {
+                await projectService.saveFiles(
+                  projectId,
+                  ctx.files.map((f) => ({ path: f.path, content: f.content, language: f.language })),
+                );
+                const snap = await checkpointService.createCheckpoint({
+                  projectId,
+                  tenantId,
+                  stage,
+                  workflowId,
+                  createdBy: `workflow:${stage}`,
+                  description:
+                    stage === 'debugger' && typeof ctx.attempt === 'number'
+                      ? `Checkpoint after debugger retry #${ctx.attempt}`
+                      : undefined,
+                });
+                this.emit(`workflow:${workflowId}`, {
+                  type: 'vibe_coder:checkpoint',
+                  workflowId,
+                  projectId,
+                  stage,
+                  version: snap.version,
+                  hasChanges: snap.diff?.hasChanges ?? false,
+                  timestamp: new Date().toISOString(),
+                });
+              } catch (err) {
+                this.log.warn(
+                  { workflowId, projectId, stage, err: err instanceof Error ? err.message : String(err) },
+                  '[VibeCoder] Checkpoint persistence failed (non-fatal)',
+                );
+              }
+            }
+          : undefined,
+      });
+
+      // Persist the final result to the workflow row.
+      const finalStatus =
+        result.status === 'completed'
+          ? 'COMPLETED'
+          : result.status === 'needs_user_input'
+          ? 'PAUSED'
+          : 'FAILED';
+
+      await (this.db.workflow.update as any)({
+        where: { id: workflowId },
+        data: {
+          status: finalStatus,
+          error: result.error ?? null,
+          finalOutput: JSON.stringify({
+            kind: 'vibe-coder',
+            files: result.files,
+            deployment: result.deployment,
+            buildLogs: result.buildLogs,
+            debugAttempts: result.debugAttempts,
+            userQuestion: result.userQuestion,
+            architecture: result.architecture?.architecture,
+          }),
+          completedAt: finalStatus === 'PAUSED' ? null : new Date(),
+        },
+      });
+
+      this.emit(`workflow:${workflowId}`, {
+        type: 'vibe_coder:completed',
+        workflowId,
+        status: result.status,
+        deploymentUrl: result.deployment?.deploymentUrl,
+        fileCount: result.files.length,
+        debugAttempts: result.debugAttempts,
+        durationMs: result.durationMs,
+        timestamp: new Date().toISOString(),
+      });
+
+      this.log.info(
+        {
+          workflowId,
+          status: result.status,
+          fileCount: result.files.length,
+          debugAttempts: result.debugAttempts,
+          durationMs: result.durationMs,
+        },
+        '[VibeCoder] Workflow finished',
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.error({ workflowId, err: message }, '[VibeCoder] Workflow threw unexpected error');
+      await this.workflowService.updateWorkflowStatus(workflowId, 'FAILED', message);
+    }
+  }
+
+  /**
+   * Resume a paused workflow after a reviewer has submitted an approval decision.
+   *
+   * - APPROVED  → resume the swarm from the worker node
+   * - REJECTED  → cancel the workflow immediately
+   * - DEFERRED  → leave PAUSED (no-op in swarm; DB status already PAUSED)
+   */
+  async resumeAfterApproval(params: ResumeParams): Promise<void> {
+    const { workflowId, tenantId, decision, reviewedBy, comment } = params;
+
+    this.log.info({ workflowId, decision, reviewedBy }, '[Swarm] Resuming after approval decision');
+
+    if (decision === 'REJECTED') {
+      // Hardening pass: full lifecycle on the rejection path so the audit
+      // log distinguishes "user rejected approval" from "workflow failed".
+      this.emitLifecycle({
+        type: 'approval_rejected',
+        workflowId,
+        approvalId: params.approvalId ?? 'unknown',
+        reviewedBy,
+        ...(comment ? { reason: comment } : {}),
+        timestamp: new Date().toISOString(),
+      }, tenantId, reviewedBy);
+      this.emitLifecycle({
+        type: 'cancelled',
+        workflowId,
+        reason: `Rejected by ${reviewedBy}${comment ? `: ${comment}` : ''}`,
+        cancelledBy: reviewedBy,
+        timestamp: new Date().toISOString(),
+      }, tenantId, reviewedBy);
+      await this.workflowService.updateWorkflowStatus(
+        workflowId,
+        'CANCELLED',
+        `Rejected by ${reviewedBy}${comment ? `: ${comment}` : ''}`,
+      );
+      // Emit SSE event so connected clients clear the spinner on
+      // approval rejection. Without this, the frontend never receives
+      // a 'cancelled' event type and the spinner stays forever.
+      this.emit(`workflow:${workflowId}`, {
+        type: 'cancelled',
+        workflowId,
+        reason: `Rejected by ${reviewedBy}${comment ? `: ${comment}` : ''}`,
+      });
+      return;
+    }
+
+    if (decision === 'DEFERRED') {
+      // Leave workflow in PAUSED; reviewer will act again later
+      this.log.info({ workflowId }, '[Swarm] Approval deferred; workflow stays PAUSED');
+      return;
+    }
+
+    // APPROVED — re-run from where we left off via WorkflowRuntime
+    // (Phase 6). The runtime adapter delegates to runner.resume under
+    // the hood today; in subsequent phases LangGraphRuntime can pick
+    // up an interrupt() and resume natively without touching this code.
+    this.emitLifecycle({
+      type: 'approval_granted',
+      workflowId,
+      approvalId: params.approvalId ?? 'unknown',
+      reviewedBy,
+      timestamp: new Date().toISOString(),
+    }, tenantId, reviewedBy);
+    this.emitLifecycle({
+      type: 'resumed',
+      workflowId,
+      reason: 'approval',
+      timestamp: new Date().toISOString(),
+    }, tenantId, reviewedBy);
+
+    try {
+      await this.workflowService.updateWorkflowStatus(workflowId, 'RUNNING');
+
+      const result = await this.workflowRuntime.resume(workflowId, {
+        decision: 'APPROVED',
+        reviewedBy,
+        comment,
+      });
+
+      await this.persistTraces(result, tenantId, workflowId);
+      await this.persistApprovals(result, tenantId, workflowId);
+
+      const dbStatus = mapSwarmStatusToDb(result.status);
+      await this.workflowService.updateWorkflowStatus(workflowId, dbStatus, result.error);
+
+      this.log.info({ workflowId, dbStatus }, '[Swarm] Resumed workflow completed');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.error({ workflowId, err: message }, '[Swarm] Resume threw unexpected error');
+      try {
+        await this.workflowService.updateWorkflowStatus(workflowId, 'FAILED', message);
+      } catch (dbErr) {
+        this.log.error({ workflowId, dbErr }, '[Swarm] Failed to mark workflow FAILED after resume error');
+      }
+    }
+  }
+
+  /**
+   * Signal the in-memory runner to stop a running workflow.
+   * The DB status should be updated separately via WorkflowService.cancelWorkflow().
+   */
+  async cancelWorkflow(params: CancelParams): Promise<void> {
+    // Phase 6 + hardening: route through WorkflowRuntime AND emit a
+    // canonical lifecycle 'cancelled' event so the audit log records
+    // who cancelled the workflow and why.
+    await this.workflowRuntime.cancel(params.workflowId);
+    if (params.tenantId) {
+      this.emitLifecycle({
+        type: 'cancelled',
+        workflowId: params.workflowId,
+        ...(params.reason ? { reason: params.reason } : {}),
+        ...(params.cancelledBy ? { cancelledBy: params.cancelledBy } : {}),
+        timestamp: new Date().toISOString(),
+      }, params.tenantId, params.cancelledBy);
+    }
+    // Also emit an SSE event so connected clients clear the spinner.
+    // Without this, the frontend's onMessage handler never receives
+    // a 'cancelled' event, and the spinner stays forever until the
+    // polling fallback catches it.
+    this.emit(`workflow:${params.workflowId}`, {
+      type: 'cancelled',
+      workflowId: params.workflowId,
+      reason: params.reason,
+    });
+  }
+
+  /** Pause a running workflow (it will pause between nodes). */
+  pauseWorkflow(workflowId: string): void {
+    this.runner.pause(workflowId);
+  }
+
+  /** Remove the pause signal so the workflow can be resumed. */
+  unpauseWorkflow(workflowId: string): void {
+    this.runner.unpause(workflowId);
+  }
+
+  /** Signal the runner to cancel a workflow immediately. */
+  stopWorkflow(workflowId: string): void {
+    this.runner.stop(workflowId);
+  }
+
+  /** Resume a previously paused workflow from its saved state. */
+  async resumeWorkflow(workflowId: string): Promise<void> {
+    const workflow = await this.db.workflow.findUnique({ where: { id: workflowId } });
+    if (!workflow) return;
+    const pendingApproval = await this.db.approvalRequest.findFirst({
+      where: { workflowId, tenantId: workflow.tenantId, status: 'PENDING' },
+      select: { id: true },
+    });
+    if (pendingApproval) {
+      this.log.warn(
+        { workflowId, approvalId: pendingApproval.id },
+        '[Swarm] Refusing generic resume while workflow has a pending approval',
+      );
+      return;
+    }
+
+    this.log.info({ workflowId }, '[Swarm] Resuming paused workflow');
+
+    try {
+      await this.workflowService.updateWorkflowStatus(workflowId, 'RUNNING');
+
+      const result = await this.runner.resume(workflowId, {
+        status: 'APPROVED',
+        reviewedBy: 'system',
+      }, {
+        loadState: async (id: string) => {
+          const wf = await this.db.workflow.findUnique({ where: { id } });
+          return (wf as any)?.stateJson ?? undefined;
+        },
+      });
+
+      await this.persistTraces(result, workflow.tenantId, workflowId);
+
+      const dbStatus = mapSwarmStatusToDb(result.status);
+      await this.workflowService.updateWorkflowStatus(workflowId, dbStatus, result.error);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.error({ workflowId, err: message }, '[Swarm] Resume paused workflow failed');
+      try {
+        await this.workflowService.updateWorkflowStatus(workflowId, 'FAILED', message);
+      } catch { /* best effort */ }
+    }
+  }
+
+  /**
+   * Recover queue intent after restart.
+   *
+   * - PENDING workflows are re-enqueued.
+   * - RUNNING/EXECUTING/VERIFYING workflows are moved back to PENDING and re-enqueued.
+   *
+   * This preserves durable execution intent rather than failing all in-flight work.
+   */
+  async recoverStaleWorkflows(): Promise<void> {
+    try {
+      const jobModel = (this.db as any).workflowJob;
+      if (jobModel) {
+        const activeJobs = await jobModel.findMany({
+          where: { status: 'ACTIVE' },
+          select: { id: true, workflowId: true, attempts: true, maxAttempts: true, updatedAt: true },
+        });
+
+        for (const job of activeJobs) {
+          const staleDurationMs = Date.now() - new Date(job.updatedAt).getTime();
+          const shouldRetry = (job.attempts ?? 0) < (job.maxAttempts ?? 5);
+          await jobModel.update({
+            where: { id: job.id },
+            data: shouldRetry
+              ? {
+                  status: 'QUEUED',
+                  availableAt: new Date(),
+                  lastError: `Recovered ACTIVE job after restart (${Math.round(staleDurationMs / 1000)}s stale).`,
+                }
+              : {
+                  status: 'DEAD',
+                  completedAt: new Date(),
+                  lastError: `Active job exceeded retry budget after restart (${Math.round(staleDurationMs / 1000)}s stale).`,
+                },
+          });
+        }
+      }
+
+      const recoverable = await this.db.workflow.findMany({
+        where: { status: { in: ['PENDING', 'RUNNING', 'EXECUTING', 'VERIFYING'] } },
+        select: {
+          id: true,
+          tenantId: true,
+          userId: true,
+          goal: true,
+          industry: true,
+          status: true,
+          updatedAt: true,
+          stateJson: true,
+          maxCostUsd: true,
+        },
+      });
+
+      for (const wf of recoverable) {
+        const staleDurationMs = Date.now() - new Date(wf.updatedAt).getTime();
+        const stateData = (wf.stateJson ?? {}) as Record<string, unknown>;
+        const checkpoint = (stateData['__checkpoint'] ?? {}) as Record<string, unknown>;
+        const replaySafety = String(checkpoint['replaySafety'] ?? 'REPLAY_SAFE');
+
+        if (replaySafety === 'MANUAL_INTERVENTION_REQUIRED') {
+          await this.db.workflow.update({
+            where: { id: wf.id },
+            data: {
+              status: 'PAUSED',
+              error: `Recovery paused for manual intervention: ${String(checkpoint['replayReason'] ?? 'Replay safety unknown')}`,
+              completedAt: null,
+            },
+          });
+
+          this.log.warn(
+            {
+              workflowId: wf.id,
+              replaySafety,
+            },
+            '[recovery] Workflow requires manual intervention before replay',
+          );
+          continue;
+        }
+
+        if (replaySafety === 'REPLAY_UNSAFE') {
+          await this.db.workflow.update({
+            where: { id: wf.id },
+            data: {
+              status: 'PAUSED',
+              error: `Recovery blocked: replay-unsafe workflow. ${String(checkpoint['replayReason'] ?? '')}`.trim(),
+              completedAt: null,
+            },
+          });
+
+          this.log.warn(
+            { workflowId: wf.id, replaySafety },
+            '[recovery] Workflow replay is unsafe — paused for operator review',
+          );
+          continue;
+        }
+
+        // Side-effecting tasks without idempotency keys are NOT safe to auto-replay.
+        // Gate them to PAUSED so an operator can decide whether to resume or discard.
+        if (replaySafety === 'REQUIRES_IDEMPOTENCY_KEY') {
+          const hasIdemKey = Boolean(checkpoint['idempotencyKey']);
+          if (!hasIdemKey) {
+            await this.db.workflow.update({
+              where: { id: wf.id },
+              data: {
+                status: 'PAUSED',
+                error: `Recovery paused: task has potential side effects and no idempotency key. ${String(checkpoint['replayReason'] ?? '')}`.trim(),
+                completedAt: null,
+              },
+            });
+
+            this.log.warn(
+              { workflowId: wf.id, replaySafety },
+              '[recovery] Side-effecting workflow without idempotency key paused for operator review',
+            );
+            continue;
+          }
+          // Has idempotency key — safe to auto-replay because the key prevents duplicate side effects
+          this.log.info(
+            { workflowId: wf.id, idempotencyKey: checkpoint['idempotencyKey'] },
+            '[recovery] Side-effecting workflow has idempotency key — proceeding with auto-replay',
+          );
+        }
+
+        if (wf.status !== 'PENDING') {
+          await this.db.workflow.update({
+            where: { id: wf.id },
+            data: {
+              status: 'PENDING',
+              error: `Recovered after restart: previous status ${wf.status} (${Math.round(staleDurationMs / 1000)}s since last update).`,
+              completedAt: null,
+            },
+          });
+        }
+
+        const roleModes = Array.isArray(stateData['roleModes'])
+          ? (stateData['roleModes'].filter((v): v is string => typeof v === 'string'))
+          : undefined;
+
+        this.enqueueExecution({
+          workflowId: wf.id,
+          tenantId: wf.tenantId,
+          userId: wf.userId,
+          goal: wf.goal,
+          industry: wf.industry ?? undefined,
+          roleModes,
+          maxCostUsd: wf.maxCostUsd ?? undefined,
+        });
+
+        this.log.warn(
+          {
+            workflowId: wf.id,
+            tenantId: wf.tenantId,
+            previousStatus: wf.status,
+            staleDurationMs,
+          },
+          '[recovery] Re-enqueued workflow after restart',
+        );
+      }
+
+      if (recoverable.length > 0) {
+        this.log.info({ count: recoverable.length }, '[recovery] Queue recovery complete');
+      }
+    } catch (err) {
+      this.log.error({ err }, '[recovery] Failed to recover stale workflows');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
+
+  private async persistTraces(
+    result: SwarmResult,
+    tenantId: string,
+    workflowId: string,
+  ): Promise<void> {
+    const traces = result.traces as SharedAgentTrace[];
+    this.log.info(
+      { workflowId, traceCount: traces.length, roles: traces.map((t) => t.agentRole) },
+      '[Swarm] Persisting agent traces',
+    );
+    let savedCount = 0;
+    for (const trace of traces) {
+      try {
+        await this.workflowService.saveTrace({
+          workflowId,
+          tenantId,
+          traceId: trace.traceId,
+          runId: trace.runId,
+          agentRole: String(trace.agentRole),
+          stepIndex: trace.stepIndex,
+          startedAt: trace.startedAt,
+          completedAt: trace.completedAt,
+          durationMs: trace.durationMs,
+          inputJson: trace.input as Record<string, unknown>,
+          outputJson: trace.output as Record<string, unknown>,
+          toolCallsJson: { calls: trace.toolCalls } as Record<string, unknown>,
+          handoffsJson: { handoffs: trace.handoffs } as Record<string, unknown>,
+          tokenUsage: trace.tokenUsage
+            ? (trace.tokenUsage as Record<string, unknown>)
+            : undefined,
+          error: trace.error,
+        });
+        savedCount += 1;
+        this.log.debug(
+          { workflowId, agentRole: trace.agentRole, stepIndex: trace.stepIndex },
+          '[Swarm] Agent trace persisted successfully',
+        );
+      } catch (err) {
+        this.log.warn(
+          { workflowId, agentRole: trace.agentRole, err },
+          '[Swarm] Failed to persist agent trace — continuing',
+        );
+      }
+    }
+    this.log.info(
+      { workflowId, expected: traces.length, saved: savedCount },
+      '[Swarm] Agent trace persistence complete',
+    );
+  }
+
+  private async persistApprovals(
+    result: SwarmResult,
+    tenantId: string,
+    workflowId: string,
+  ): Promise<void> {
+    const approvals = result.pendingApprovals as SharedApprovalRequest[];
+    for (const approval of approvals) {
+      try {
+        // Idempotency: skip if this task's approval was already persisted
+        const existing = await this.db.approvalRequest.findFirst({
+          where: { workflowId, taskId: approval.taskId },
+          select: { id: true },
+        });
+
+        if (existing) continue;
+
+        await this.workflowService.createApprovalRequest({
+          workflowId,
+          tenantId,
+          taskId: approval.taskId,
+          agentRole: String(approval.agentRole),
+          action: approval.action,
+          rationale: approval.rationale,
+          proposedDataJson: approval.proposedData as Record<string, unknown>,
+          riskLevel: String(approval.riskLevel),
+          // Item B (OpenClaw-inspired Phase 1) — reviewer-context surface.
+          // Pass through whatever the approval-node populated; the
+          // create method computes the canonical-hash + persists.
+          toolName: approval.toolName,
+          filesAffected: approval.filesAffected,
+          externalService: approval.externalService,
+          idempotencyKey: approval.idempotencyKey,
+          expectedResult: approval.expectedResult,
+        });
+      } catch (err) {
+        this.log.warn(
+          { workflowId, taskId: approval.taskId, err },
+          '[Swarm] Failed to persist approval request — continuing',
+        );
+      }
+    }
+  }
+
+  /**
+   * Compile a workflow's final user-facing output from the collected agent
+   * traces. Live bug fix: prior implementation dumped the raw JSON of every
+   * orchestration trace (Commander/Planner/Router/Verifier) with `## ROLE`
+   * markdown headers when the trace didn't expose a string field. Users saw
+   * `## PLANNER\n\n{"plan": {...}}` as the "answer" to "what is 2+2".
+   *
+   * Rules now:
+   *   1. Orchestration roles (Commander/Planner/Router/Verifier) are NEVER
+   *      user-facing. They are workflow scaffolding — filtered out here.
+   *   2. Only WORKER_* roles can produce user-facing output.
+   *   3. Worker outputs must be string-shaped (content/summary/document/
+   *      result/answer/response) to qualify. Structured-only outputs with no
+   *      user-facing field are summarized as "<role> produced structured
+   *      output (see trace)" instead of being JSON-dumped.
+   *   4. If a single worker ran, emit just that worker's content with no
+   *      section header (avoids the unnecessary "## RESEARCH" noise for
+   *      simple questions).
+   *   5. If multiple workers contributed, section them by role so the user
+   *      can see who said what.
+   */
+  private compileFinalOutput(traces: Array<{ agentRole: string; outputJson: unknown; stepIndex: number }>): string {
+    if (!traces || traces.length === 0) return 'No output produced.';
+
+    // Roles whose output is internal orchestration metadata — never user-facing.
+    const ORCHESTRATION_ROLES = new Set([
+      'COMMANDER', 'PLANNER', 'ROUTER', 'VERIFIER', 'SWARMRUNNER', 'SUPERVISOR',
+    ]);
+
+    // Fields that are *known* to contain a user-facing string. Ordered by
+    // preference — first hit wins. Covers the output shapes across all 32
+    // worker agents: Research returns {findings}, Marketing/Content
+    // return {draft}, Finance/Legal return {analysis}, Strategist returns
+    // {recommendation}, most generic tool loops return {content}, etc.
+    const STRING_FIELDS = [
+      'content', 'answer', 'response', 'message',
+      'findings',      // ResearchAgent
+      'summary', 'document', 'result', 'output',
+      'draft',         // Content/Marketing agents — drafted posts, emails, copy
+      'code',          // CoderAgent / AppGeneratorAgent — raw source code
+      'architecture',  // TechnicalAgent / AppArchitectAgent — system design prose
+      'analysis',      // Finance/Legal/HR
+      'strategy',      // MarketingAgent / StrategistAgent
+      'recommendation', 'recommendations', 'conclusion',  // Strategy / TechnicalAgent
+      'explanation',   // CoderAgent / any agent explaining its work
+      'plan',          // Planner-ish
+      'text', 'body',  // Generic
+      'report',        // Analytics/PR
+      'risks',         // TechnicalAgent — prioritized risk list
+      'tradeoffs',     // TechnicalAgent — decision trade-offs
+      'scalabilityNotes', // TechnicalAgent — scaling observations
+      'diagramDescription', // TechnicalAgent — architecture diagram prose
+      'designSpec',    // DesignerAgent — design specification
+      'layoutGrid',    // DesignerAgent — responsive layout rules
+      'userFlowDescription', // DesignerAgent — user flow prose
+      'overallDescription', // ScreenshotToCodeAgent — image-to-layout prose
+      'layoutAnalysis', // ScreenshotToCodeAgent — pixel analysis
+      'diagnosis',     // AppDebuggerAgent — error diagnosis
+      'rootCause',     // AppDebuggerAgent — root cause statement
+    ];
+
+    type Section = { role: string; content: string };
+    const sections: Section[] = [];
+    const sorted = [...traces].sort((a, b) => (a.stepIndex ?? 0) - (b.stepIndex ?? 0));
+
+    for (const trace of sorted) {
+      if (!trace.outputJson) continue;
+      const rawRole = trace.agentRole ?? 'Agent';
+      if (ORCHESTRATION_ROLES.has(rawRole)) continue;
+
+      const output = trace.outputJson;
+      let content: string | null = null;
+
+      // Common generic stub strings some workers return when they have
+      // no substantive response. Detecting these means we skip them and
+      // fall through to render keyPoints (which usually contain the
+      // actual substance) instead of showing the user a hollow sentence.
+      const STUB_PATTERNS = [
+        /research completed\.?\s*see key points/i,
+        /task completed\.?\s*see (details|key points)/i,
+        /^analysis complete\.?\s*$/i,
+        /^completed\.?\s*$/i,
+        /no (detailed|specific) (findings|response)/i,
+      ];
+      const isStub = (s: string) => STUB_PATTERNS.some((p) => p.test(s.trim()));
+
+      // A worker can contribute multiple pieces that we render together:
+      //   1. the primary string field (findings/summary/content/...)
+      //   2. a keyPoints bullet list, if present
+      // Stub strings are dropped so they don't mask the real content.
+      const pieces: string[] = [];
+
+      if (typeof output === 'string') {
+        if (!isStub(output)) pieces.push(output);
+      } else if (typeof output === 'object' && output !== null) {
+        const obj = output as Record<string, unknown>;
+        // Try known string fields first.
+        for (const field of STRING_FIELDS) {
+          const v = obj[field];
+          if (typeof v === 'string' && v.trim().length > 0 && !isStub(v)) {
+            pieces.push(v.trim());
+            break;
+          }
+          // Some fields (risks, tradeoffs, etc.) are string arrays — join them.
+          if (Array.isArray(v)) {
+            const joined = v
+              .filter((item): item is string => typeof item === 'string')
+              .map((s) => s.trim())
+              .filter((s) => s.length > 0 && !isStub(s))
+              .join('\n');
+            if (joined.length > 0) {
+              pieces.push(joined);
+              break;
+            }
+          }
+        }
+        // Always also render keyPoints if present — they frequently carry
+        // the actual substance even when findings/summary is a stub.
+        if (Array.isArray(obj['keyPoints'])) {
+          const bullets = (obj['keyPoints'] as unknown[])
+            .map((kp) => {
+              if (typeof kp === 'string') return kp;
+              if (kp && typeof kp === 'object') {
+                const o = kp as Record<string, unknown>;
+                // Common keyPoint shapes: {point, source}, {text}, {content}
+                if (typeof o['point'] === 'string') return o['point'] as string;
+                if (typeof o['text'] === 'string') return o['text'] as string;
+                if (typeof o['content'] === 'string') return o['content'] as string;
+              }
+              return null;
+            })
+            .filter((x): x is string => typeof x === 'string' && x.trim().length > 0);
+          if (bullets.length > 0) pieces.push(bullets.map((b) => `- ${b}`).join('\n'));
+        }
+        // Last-resort fallback: find the LONGEST string field on the object
+        // and surface it. Avoids JSON-dumping but still gets *something*
+        // user-facing for unknown agent output shapes.
+        if (pieces.length === 0) {
+          let longest = '';
+          for (const v of Object.values(obj)) {
+            if (typeof v === 'string' && v.trim().length > longest.length && !isStub(v)) {
+              longest = v;
+            }
+          }
+          if (longest.trim().length >= 10) pieces.push(longest);
+        }
+      }
+
+      content = pieces.length > 0 ? pieces.join('\n\n') : null;
+
+      if (!content || !content.trim()) continue;
+
+      const displayRole = rawRole.replace('WORKER_', '').replace(/_/g, ' ');
+      sections.push({ role: displayRole, content: content.trim() });
+    }
+
+    if (sections.length === 0) {
+      return 'Agents completed their work but did not produce a user-facing response. View the run in Traces for structured output.';
+    }
+
+    // Single-worker: emit just the content, no header noise.
+    const first = sections[0];
+    if (sections.length === 1 && first) {
+      return first.content;
+    }
+
+    // Multi-worker: section by role so the user can see who said what.
+    return sections.map((s) => `## ${s.role}\n\n${s.content}`).join('\n\n---\n\n');
+  }
+}

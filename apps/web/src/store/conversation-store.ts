@@ -1,0 +1,490 @@
+'use client';
+
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+import { ROLE_IDS, type RoleId } from '@/lib/role-config';
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+export interface Message {
+  id: string;
+  conversationId: string;
+  role: 'user' | 'assistant';
+  /** Which agent role authored this (null for user messages) */
+  agentRole: RoleId | null;
+  content: string;
+  createdAt: number;
+  /** Execution metadata, lazy-loaded */
+  executionTrace?: {
+    workflowId?: string;
+    steps?: { name: string; status: string; duration?: number }[];
+  };
+  /**
+   * P1-4: When the workflow pauses for human approval, the cockpit
+   * surfaces inline Approve / Reject / Defer buttons on the chat
+   * message instead of forcing a navigation to /workspace?tab=approvals.
+   * `status` flips from 'pending' → 'approved' / 'rejected' / 'deferred'
+   * once the user clicks; the buttons hide on terminal states.
+   *
+   * `approvalId` may be undefined at the moment the `paused` SSE event
+   * fires (the approval row is sometimes created lazily server-side);
+   * the inline UI then falls back to the workflow-resume endpoint
+   * which the API exposes specifically for this case.
+   */
+  approvalAction?: {
+    workflowId: string;
+    approvalId?: string;
+    /** What the user is approving — surfaced verbatim from the SSE event. */
+    reason: string;
+    status: 'pending' | 'approved' | 'rejected' | 'deferred';
+    /** ISO timestamp of the user's decision (set once status leaves 'pending'). */
+    decidedAt?: string;
+    /** Free-text comment the user added (optional). */
+    comment?: string;
+    /** If the API call fails, surface the error so the user can retry. */
+    error?: string;
+    /**
+     * Item B (OpenClaw-inspired Phase 1) — reviewer-context surface.
+     * The inline approval card renders these BELOW `reason` so the
+     * approver can see the SPECIFIC tool / files / external service /
+     * expected result they're binding their decision to. All optional
+     * — older approvals (pre-Item B) leave them undefined and the UI
+     * gracefully shows just `reason`.
+     *
+     * `runSandboxFirst` is a UI-only flag that flips a "Run sandbox
+     * first" placeholder button on the card; the route it would call
+     * (`POST /approvals/:id/sandbox-test`) is Phase 2 work, so the
+     * button is wired but reports a "coming soon" toast for now.
+     */
+    toolName?: string;
+    filesAffected?: string[];
+    externalService?: string;
+    expectedResult?: string;
+    proposedDataHash?: string;
+    runSandboxFirst?: boolean;
+  };
+}
+
+export interface Conversation {
+  id: string;
+  title: string;
+  /** Roles active for this conversation */
+  roles: RoleId[];
+  createdAt: number;
+  updatedAt: number;
+  /** Optional project grouping */
+  projectId?: string;
+}
+
+export interface ConversationState {
+  conversations: Conversation[];
+  activeConversationId: string | null;
+  messages: Record<string, Message[]>;
+  /** Currently selected roles for the next message */
+  activeRoles: RoleId[];
+  /** Sidebar collapsed state */
+  sidebarCollapsed: boolean;
+  /** Detail drawer open state */
+  drawerOpen: boolean;
+  /**
+   * `true` once zustand-persist has finished rehydrating from
+   * localStorage. Components that depend on `activeConversationId`
+   * (notably the chat Send button) should disable themselves until
+   * this flips, or they risk firing a no-op send before the persisted
+   * conversation is restored. Set by `onRehydrateStorage` below; SSR
+   * always reads it as `false` (Next.js + zustand-persist contract).
+   */
+  _hasHydrated: boolean;
+}
+
+export interface ConversationActions {
+  createConversation: (roles?: RoleId[]) => string;
+  /**
+   * Returns the active conversation id, creating one if none exists.
+   * Used by handleSend so a "Send" click that lands before persist
+   * has rehydrated cannot silently no-op — there's always a target
+   * conversation. Idempotent: when activeConversationId is already
+   * set, returns it without creating a new one.
+   */
+  ensureActiveConversation: (roles?: RoleId[]) => string;
+  deleteConversation: (id: string) => void;
+  switchConversation: (id: string) => void;
+  setActiveRoles: (roles: RoleId[]) => void;
+  toggleRole: (role: RoleId) => void;
+  addMessage: (conversationId: string, message: Omit<Message, 'id' | 'conversationId' | 'createdAt'>) => void;
+  /**
+   * Patch an existing message in-place. Used for the inline-approval flow
+   * where the cockpit needs to flip the embedded `approvalAction.status`
+   * from 'pending' → 'approved'/'rejected' once the user clicks, without
+   * adding a new chat bubble for what's just a state change on an
+   * existing one.
+   */
+  updateMessage: (conversationId: string, messageId: string, patch: Partial<Message>) => void;
+  updateConversationTitle: (id: string, title: string) => void;
+  setSidebarCollapsed: (collapsed: boolean) => void;
+  setDrawerOpen: (open: boolean) => void;
+  /** Marks the persist layer as fully rehydrated. Internal — called only
+   *  from `onRehydrateStorage`. Tests can call it manually to skip the
+   *  hydration race. */
+  _setHasHydrated: (hydrated: boolean) => void;
+  /**
+   * Clear all conversations and messages. Used when the user
+   * identity changes (different email login) to prevent stale
+   * data from a previous account appearing in the workspace.
+   */
+  clearAll: () => void;
+}
+
+type PersistedConversationState = Pick<
+  ConversationState,
+  'conversations' | 'activeConversationId' | 'messages' | 'activeRoles'
+>;
+
+const DEFAULT_ACTIVE_ROLES: RoleId[] = ['cto'];
+
+function isRoleId(value: unknown): value is RoleId {
+  return typeof value === 'string' && ROLE_IDS.includes(value as RoleId);
+}
+
+function normalizeRoles(value: unknown): RoleId[] {
+  const roles = Array.isArray(value)
+    ? value.filter(isRoleId)
+    : isRoleId(value)
+      ? [value]
+      : [];
+
+  return roles.length > 0 ? Array.from(new Set(roles)) : DEFAULT_ACTIVE_ROLES;
+}
+
+function normalizeConversations(value: unknown): Conversation[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') {
+      return [];
+    }
+
+    const record = entry as Record<string, unknown>;
+    if (typeof record.id !== 'string' || record.id.length === 0) {
+      return [];
+    }
+
+    const createdAt = typeof record.createdAt === 'number' ? record.createdAt : Date.now();
+    const updatedAt = typeof record.updatedAt === 'number' ? record.updatedAt : createdAt;
+
+    return [{
+      id: record.id,
+      title: typeof record.title === 'string' && record.title.trim().length > 0
+        ? record.title
+        : 'New conversation',
+      roles: normalizeRoles(record.roles),
+      createdAt,
+      updatedAt,
+      projectId: typeof record.projectId === 'string' ? record.projectId : undefined,
+    }];
+  });
+}
+
+function normalizeMessages(value: unknown): Record<string, Message[]> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const normalized: Record<string, Message[]> = {};
+
+  for (const [conversationId, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (!Array.isArray(entry)) {
+      continue;
+    }
+
+    normalized[conversationId] = entry.flatMap((item) => {
+      if (!item || typeof item !== 'object') {
+        return [];
+      }
+
+      const record = item as Record<string, unknown>;
+      if (typeof record.content !== 'string' || (record.role !== 'user' && record.role !== 'assistant')) {
+        return [];
+      }
+
+      const executionTrace =
+        record.executionTrace && typeof record.executionTrace === 'object'
+          ? (() => {
+              const trace = record.executionTrace as Record<string, unknown>;
+              const steps = Array.isArray(trace.steps)
+                ? trace.steps.flatMap((step) => {
+                    if (!step || typeof step !== 'object') {
+                      return [];
+                    }
+                    const stepRecord = step as Record<string, unknown>;
+                    if (typeof stepRecord.name !== 'string' || typeof stepRecord.status !== 'string') {
+                      return [];
+                    }
+                    return [{
+                      name: stepRecord.name,
+                      status: stepRecord.status,
+                      duration: typeof stepRecord.duration === 'number' ? stepRecord.duration : undefined,
+                    }];
+                  })
+                : undefined;
+
+              return {
+                workflowId: typeof trace.workflowId === 'string' ? trace.workflowId : undefined,
+                steps,
+              };
+            })()
+          : undefined;
+
+      return [{
+        id: typeof record.id === 'string' ? record.id : generateId(),
+        conversationId,
+        role: record.role,
+        agentRole: isRoleId(record.agentRole) ? record.agentRole : null,
+        content: record.content,
+        createdAt: typeof record.createdAt === 'number' ? record.createdAt : Date.now(),
+        executionTrace,
+      }];
+    });
+  }
+
+  return normalized;
+}
+
+function sanitizeConversationState(value: unknown): PersistedConversationState {
+  const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const conversations = normalizeConversations(record.conversations);
+  const messages = normalizeMessages(record.messages);
+  const activeConversationId =
+    typeof record.activeConversationId === 'string' && conversations.some((conv) => conv.id === record.activeConversationId)
+      ? record.activeConversationId
+      : conversations[0]?.id ?? null;
+
+  return {
+    conversations,
+    activeConversationId,
+    messages,
+    activeRoles: normalizeRoles(record.activeRoles),
+  };
+}
+
+// ─── Store ───────────────────────────────────────────────────────────────────
+
+// P1-2 (audit 2026-05-08): keep the timestamp prefix (used by the UI to
+// sort message order without a separate clock) but source the random tail
+// from a browser-safe crypto UUID helper.
+import { generateBrowserId } from '@/lib/id';
+function generateId(): string {
+  return `${Date.now()}-${generateBrowserId().slice(0, 8)}`;
+}
+
+export const useConversationStore = create<ConversationState & ConversationActions>()(
+  persist(
+    (set, get) => ({
+      // State
+      conversations: [],
+      activeConversationId: null,
+      messages: {},
+      activeRoles: DEFAULT_ACTIVE_ROLES,
+      sidebarCollapsed: false,
+      drawerOpen: false,
+      _hasHydrated: false,
+
+      // Actions
+      createConversation: (roles) => {
+        const id = generateId();
+        const selectedRoles = normalizeRoles(roles ?? get().activeRoles);
+        const conversation: Conversation = {
+          id,
+          title: 'New conversation',
+          roles: selectedRoles,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        set((state) => ({
+          conversations: [conversation, ...state.conversations],
+          activeConversationId: id,
+          messages: { ...state.messages, [id]: [] },
+          activeRoles: selectedRoles,
+        }));
+        return id;
+      },
+
+      /**
+       * Returns the active conversation id, creating one if none exists.
+       * The Send button calls this so a click that lands before persist
+       * has rehydrated cannot silently no-op — there's always a target
+       * conversation. Idempotent: with an active id, returns it as-is
+       * without mutating state.
+       */
+      ensureActiveConversation: (roles) => {
+        const existing = get().activeConversationId;
+        if (existing) {
+          // Verify the conversation still exists (defensive — after a
+          // delete the activeConversationId can briefly point at a
+          // tombstone before the UI reads the next one).
+          const stillExists = get().conversations.some((c) => c.id === existing);
+          if (stillExists) return existing;
+        }
+        return get().createConversation(roles);
+      },
+
+      deleteConversation: (id) => {
+        set((state) => {
+          const { [id]: _, ...rest } = state.messages;
+          const remaining = state.conversations.filter((c) => c.id !== id);
+          return {
+            conversations: remaining,
+            messages: rest,
+            activeConversationId:
+              state.activeConversationId === id
+                ? remaining[0]?.id ?? null
+                : state.activeConversationId,
+          };
+        });
+      },
+
+      switchConversation: (id) => {
+        const conv = get().conversations.find((c) => c.id === id);
+        if (conv) {
+          set({ activeConversationId: id, activeRoles: normalizeRoles(conv.roles) });
+        }
+      },
+
+      setActiveRoles: (roles) => {
+        const normalizedRoles = normalizeRoles(roles);
+        set({ activeRoles: normalizedRoles });
+        const activeId = get().activeConversationId;
+        if (activeId) {
+          set((state) => ({
+            conversations: state.conversations.map((c) =>
+              c.id === activeId ? { ...c, roles: normalizedRoles } : c,
+            ),
+          }));
+        }
+      },
+
+      toggleRole: (role) => {
+        const current = normalizeRoles(get().activeRoles);
+        const next = current.includes(role)
+          ? current.filter((r) => r !== role)
+          : [...current, role];
+        // Must have at least one role
+        if (next.length > 0) {
+          get().setActiveRoles(next);
+        }
+      },
+
+      addMessage: (conversationId, message) => {
+        const newMsg: Message = {
+          ...message,
+          id: generateId(),
+          conversationId,
+          createdAt: Date.now(),
+        };
+        set((state) => {
+          const existing = state.messages[conversationId] ?? [];
+          // Auto-title from first user message
+          const isFirst = existing.length === 0 && message.role === 'user';
+          return {
+            messages: {
+              ...state.messages,
+              [conversationId]: [...existing, newMsg],
+            },
+            conversations: state.conversations.map((c) =>
+              c.id === conversationId
+                ? {
+                    ...c,
+                    updatedAt: Date.now(),
+                    ...(isFirst && { title: message.content.slice(0, 60) }),
+                  }
+                : c,
+            ),
+          };
+        });
+      },
+
+      updateMessage: (conversationId, messageId, patch) => {
+        set((state) => {
+          const existing = state.messages[conversationId];
+          if (!existing) return state;
+          return {
+            messages: {
+              ...state.messages,
+              [conversationId]: existing.map((m) =>
+                m.id === messageId ? { ...m, ...patch } : m,
+              ),
+            },
+          };
+        });
+      },
+
+      updateConversationTitle: (id, title) => {
+        set((state) => ({
+          conversations: state.conversations.map((c) =>
+            c.id === id ? { ...c, title } : c,
+          ),
+        }));
+      },
+
+      setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),
+      setDrawerOpen: (open) => set({ drawerOpen: open }),
+      _setHasHydrated: (hydrated) => set({ _hasHydrated: hydrated }),
+
+      /**
+       * Clear all conversations and messages. Used when the user
+       * identity changes (different email login) to prevent stale
+       * data from a previous account appearing in the workspace.
+       */
+      clearAll: () => set({
+        conversations: [],
+        activeConversationId: null,
+        messages: {},
+      }),
+    }),
+    {
+      name: 'jak-conversations',
+      version: 1,
+      migrate: (persistedState) => sanitizeConversationState(persistedState),
+      merge: (persistedState, currentState) => ({
+        ...currentState,
+        ...sanitizeConversationState(persistedState),
+      }),
+      partialize: (state) => ({
+        conversations: state.conversations,
+        activeConversationId: state.activeConversationId,
+        messages: state.messages,
+        activeRoles: normalizeRoles(state.activeRoles),
+      }),
+      // Flip `_hasHydrated` to true once persist has finished pulling
+      // from localStorage. Without this, the chat Send button can fire
+      // before the persisted `activeConversationId` is restored — the
+      // send used to silently no-op in that race. With this flag the
+      // input renders a "Loading workspace…" hint until ready.
+      onRehydrateStorage: () => (state) => {
+        state?._setHasHydrated(true);
+      },
+    },
+  ),
+);
+
+// ─── Selectors ───────────────────────────────────────────────────────────────
+// Use single selectors to avoid re-renders from multiple subscriptions deriving
+// the same value.
+
+const EMPTY_MESSAGES: Message[] = [];
+
+export function useActiveConversation() {
+  return useConversationStore((s) =>
+    s.activeConversationId
+      ? s.conversations.find((c) => c.id === s.activeConversationId) ?? null
+      : null,
+  );
+}
+
+export function useActiveMessages() {
+  return useConversationStore((s) =>
+    s.activeConversationId ? s.messages[s.activeConversationId] ?? EMPTY_MESSAGES : EMPTY_MESSAGES,
+  );
+}

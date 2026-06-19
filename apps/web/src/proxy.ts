@@ -1,0 +1,123 @@
+import { createServerClient } from '@supabase/ssr';
+import { NextResponse, type NextRequest } from 'next/server';
+import { normalizeSupabaseProjectUrl } from '@/lib/supabase-url';
+
+// ─── Supabase Auth Proxy ───────────────────────────────────────────────────
+// Refreshes the user's session on every request so it doesn't expire.
+// Also protects dashboard routes — unauthenticated users get redirected to /login.
+
+const PUBLIC_PATHS = new Set([
+  '/',
+  '/login',
+  '/register',
+  '/forgot-password',
+  '/reset-password',
+  '/onboarding',
+  '/privacy',
+  '/terms',
+  '/trial',
+  '/auth/callback',
+  '/auth/confirm',
+]);
+
+function isPublicPath(pathname: string): boolean {
+  if (PUBLIC_PATHS.has(pathname)) return true;
+  if (pathname.startsWith('/login/')) return true;
+  if (pathname.startsWith('/trial/')) return true;
+  if (pathname.startsWith('/auditor/accept/')) return true;
+  if (pathname === '/auditor/runs' || pathname.startsWith('/auditor/runs/')) return true;
+  if (process.env['NODE_ENV'] !== 'production' && pathname.startsWith('/e2e/')) return true;
+  // Allow static assets and API routes
+  if (pathname.startsWith('/_next') || pathname.startsWith('/api') || pathname.startsWith('/favicon')) return true;
+  // Allow static file extensions only (not arbitrary dots in paths)
+  if (/\.(svg|png|jpg|jpeg|gif|webp|ico|css|js|woff2?|ttf|eot|map|txt|xml|json)$/i.test(pathname)) return true;
+  return false;
+}
+
+/**
+ * DEV-ONLY auth bypass — when `NEXT_PUBLIC_JAK_DEV_AUTH_BYPASS=1` AND
+ * NODE_ENV is not production, the proxy short-circuits the entire
+ * Supabase round-trip. Every request passes through; the dashboard
+ * layout's client-side `useAuth` hook returns the synthetic dev user
+ * (apps/web/src/lib/auth.ts) so the cockpit renders without a real
+ * Supabase session.
+ *
+ * Three layers of safety match the API contract: env-flag opt-in +
+ * NODE_ENV gate + the API still validates the literal `Bearer
+ * jak-dev-bypass` token on every backend call. Any one of those
+ * disabled blocks the bypass.
+ */
+const DEV_BYPASS_ACTIVE =
+  process.env['NEXT_PUBLIC_JAK_DEV_AUTH_BYPASS'] === '1' &&
+  process.env['NODE_ENV'] !== 'production';
+
+export async function proxy(request: NextRequest) {
+  if (DEV_BYPASS_ACTIVE) {
+    return NextResponse.next({ request });
+  }
+
+  let supabaseResponse = NextResponse.next({ request });
+  const supabaseUrl = normalizeSupabaseProjectUrl(process.env['NEXT_PUBLIC_SUPABASE_URL']);
+
+  const supabase = createServerClient(
+    supabaseUrl,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll();
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value, options }) =>
+            request.cookies.set(name, value),
+          );
+          supabaseResponse = NextResponse.next({ request });
+          cookiesToSet.forEach(({ name, value, options }) =>
+            supabaseResponse.cookies.set(name, value, options),
+          );
+        },
+      },
+    },
+  );
+
+  // IMPORTANT: Do NOT run any logic between createServerClient and
+  // supabase.auth.getUser(). A simple mistake can make your app very
+  // slow — see the Supabase docs for details.
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  const pathname = request.nextUrl.pathname;
+  const hasJakJwt = Boolean(request.cookies.get('jak-auth-token')?.value);
+
+  // If user is NOT logged in and trying to access a protected route → redirect to /login
+  if (!user && !hasJakJwt && !isPublicPath(pathname)) {
+    const url = request.nextUrl.clone();
+    url.pathname = '/login';
+    url.searchParams.set('redirectTo', pathname);
+    return NextResponse.redirect(url);
+  }
+
+  // If user IS logged in and trying to access login/register → redirect to /workspace
+  if (user && (pathname === '/login' || pathname === '/register')) {
+    const url = request.nextUrl.clone();
+    url.pathname = '/workspace';
+    return NextResponse.redirect(url);
+  }
+
+  return supabaseResponse;
+}
+
+export const config = {
+  matcher: [
+    /*
+     * Match all request paths except for the ones starting with:
+     * - _next/static (static files)
+     * - _next/image (image optimization files)
+     * - favicon.ico (favicon file)
+     * Feel free to modify this pattern to include more paths.
+     */
+    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
+  ],
+};

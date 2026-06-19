@@ -1,0 +1,392 @@
+/**
+ * Vector memory adapter for semantic search.
+ *
+ * - Primary: PostgreSQL + pgvector via Prisma $queryRawUnsafe
+ * - Fallback: In-memory brute-force cosine similarity
+ *
+ * Both implement the same VectorMemoryAdapter interface.
+ */
+
+import { getEmbeddingService, type EmbeddingService } from './embedding.service.js';
+
+// ─── Interface ──────────────────────────────────────────────────────────────
+
+export interface VectorSearchResult {
+  content: string;
+  score: number;
+  metadata?: Record<string, unknown>;
+  sourceKey?: string;
+  sourceType: string;
+  chunkIndex: number;
+}
+
+export interface VectorMemoryAdapter {
+  ingest(
+    tenantId: string,
+    content: string,
+    metadata?: Record<string, unknown>,
+    sourceType?: string,
+    sourceKey?: string,
+    opts?: { scopeType?: string; scopeId?: string; documentId?: string },
+  ): Promise<number>; // returns chunk count
+
+  search(
+    tenantId: string,
+    query: string,
+    topK?: number,
+    scoreThreshold?: number,
+    opts?: { scopeType?: string; scopeId?: string; documentId?: string },
+  ): Promise<VectorSearchResult[]>;
+
+  delete(tenantId: string, sourceKey: string, opts?: { scopeType?: string; scopeId?: string }): Promise<number>; // returns deleted count
+}
+
+// ─── Text Chunking ──────────────────────────────────────────────────────────
+
+const CHUNK_SIZE = 500; // characters (~125 tokens)
+const CHUNK_OVERLAP = 80;
+
+export function chunkText(text: string): string[] {
+  const separators = ['\n\n', '\n', '. ', ' '];
+  return recursiveChunk(text, separators, CHUNK_SIZE, CHUNK_OVERLAP);
+}
+
+function recursiveChunk(
+  text: string,
+  separators: string[],
+  maxSize: number,
+  overlap: number,
+): string[] {
+  if (text.length <= maxSize) return [text.trim()].filter(Boolean);
+
+  const sep = separators.find((s) => text.includes(s)) ?? '';
+  const parts = sep ? text.split(sep) : [text.slice(0, maxSize), text.slice(maxSize)];
+
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const part of parts) {
+    const candidate = current ? current + sep + part : part;
+    if (candidate.length > maxSize && current) {
+      chunks.push(current.trim());
+      // Overlap: keep the tail of the previous chunk
+      const overlapText = current.slice(-overlap);
+      current = overlapText + sep + part;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+
+  return chunks;
+}
+
+// ─── Cosine Similarity ──────────────────────────────────────────────────────
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const ai = a[i] ?? 0;
+    const bi = b[i] ?? 0;
+    dot += ai * bi;
+    normA += ai * ai;
+    normB += bi * bi;
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+// ─── In-Memory Implementation ───────────────────────────────────────────────
+
+interface InMemoryDoc {
+  content: string;
+  embedding: number[];
+  metadata?: Record<string, unknown>;
+  sourceKey?: string;
+  sourceType: string;
+  chunkIndex: number;
+  tenantId: string;
+  scopeType: string;
+  scopeId: string;
+  documentId?: string;
+}
+
+export class InMemoryVectorAdapter implements VectorMemoryAdapter {
+  private docs: InMemoryDoc[] = [];
+  private embedder: EmbeddingService;
+
+  constructor(embedder?: EmbeddingService) {
+    this.embedder = embedder ?? getEmbeddingService();
+  }
+
+  async ingest(
+    tenantId: string,
+    content: string,
+    metadata?: Record<string, unknown>,
+    sourceType = 'DOCUMENT',
+    sourceKey?: string,
+    opts?: { scopeType?: string; scopeId?: string; documentId?: string },
+  ): Promise<number> {
+    const chunks = chunkText(content);
+    const embeddings = await this.embedder.embedBatch(chunks);
+    const scopeType = opts?.scopeType ?? 'TENANT';
+    const scopeId = opts?.scopeId ?? tenantId;
+    const documentId = opts?.documentId;
+
+    if (sourceKey) {
+      this.docs = this.docs.filter((d) => !(
+        d.tenantId === tenantId &&
+        d.scopeType === scopeType &&
+        d.scopeId === scopeId &&
+        d.sourceKey === sourceKey
+      ));
+    }
+
+    for (let i = 0; i < chunks.length; i++) {
+      this.docs.push({
+        content: chunks[i] ?? '',
+        embedding: embeddings[i] ?? [],
+        metadata,
+        sourceKey,
+        sourceType,
+        chunkIndex: i,
+        tenantId,
+        scopeType,
+        scopeId,
+        ...(documentId ? { documentId } : {}),
+      } as InMemoryDoc);
+    }
+
+    return chunks.length;
+  }
+
+  async search(
+    tenantId: string,
+    query: string,
+    topK = 5,
+    scoreThreshold = 0.5,
+    opts?: { scopeType?: string; scopeId?: string },
+  ): Promise<VectorSearchResult[]> {
+    const queryEmb = await this.embedder.embed(query);
+    const scopeType = opts?.scopeType ?? 'TENANT';
+    const scopeId = opts?.scopeId ?? tenantId;
+    const tenantDocs = this.docs.filter((d) =>
+      d.tenantId === tenantId && d.scopeType === scopeType && d.scopeId === scopeId,
+    );
+
+    const scored = tenantDocs
+      .map((doc) => ({
+        ...doc,
+        score: cosineSimilarity(queryEmb, doc.embedding),
+      }))
+      .filter((d) => d.score >= scoreThreshold)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topK);
+
+    return scored.map((d) => ({
+      content: d.content,
+      score: d.score,
+      metadata: d.metadata,
+      sourceKey: d.sourceKey,
+      sourceType: d.sourceType,
+      chunkIndex: d.chunkIndex,
+    }));
+  }
+
+  async delete(tenantId: string, sourceKey: string, opts?: { scopeType?: string; scopeId?: string }): Promise<number> {
+    const before = this.docs.length;
+    const scopeType = opts?.scopeType ?? 'TENANT';
+    const scopeId = opts?.scopeId ?? tenantId;
+    this.docs = this.docs.filter(
+      (d) => !(
+        d.tenantId === tenantId &&
+        d.scopeType === scopeType &&
+        d.scopeId === scopeId &&
+        d.sourceKey === sourceKey
+      ),
+    );
+    return before - this.docs.length;
+  }
+}
+
+// ─── pgvector Implementation ────────────────────────────────────────────────
+
+export class PgVectorAdapter implements VectorMemoryAdapter {
+  private prisma: unknown; // PrismaClient — typed as unknown to avoid import issues
+  private embedder: EmbeddingService;
+
+  constructor(prisma: unknown, embedder?: EmbeddingService) {
+    this.prisma = prisma;
+    this.embedder = embedder ?? getEmbeddingService();
+  }
+
+  async ingest(
+    tenantId: string,
+    content: string,
+    metadata?: Record<string, unknown>,
+    sourceType = 'DOCUMENT',
+    sourceKey?: string,
+    opts?: { scopeType?: string; scopeId?: string; documentId?: string },
+  ): Promise<number> {
+    const chunks = chunkText(content);
+    const embeddings = await this.embedder.embedBatch(chunks);
+    const db = this.prisma as { $executeRawUnsafe: (query: string, ...args: unknown[]) => Promise<number> };
+    const scopeType = opts?.scopeType ?? 'TENANT';
+    const scopeId = opts?.scopeId ?? tenantId;
+    const documentId = opts?.documentId ?? null;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const emb = embeddings[i] ?? [];
+      const vecStr = `[${emb.join(',')}]`;
+      const meta = metadata ? JSON.stringify(metadata) : null;
+      const contentHash = hashString(chunks[i] ?? '');
+
+      await db.$executeRawUnsafe(
+        `INSERT INTO vector_documents ("id", "tenantId", "scopeType", "scopeId", content, embedding, metadata, "sourceKey", "sourceType", "chunkIndex", "contentHash", "documentId", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::vector, $6::jsonb, $7, $8, $9, $10, $11, NOW(), NOW())
+         ON CONFLICT ("tenantId", "scopeType", "scopeId", "sourceKey", "chunkIndex") DO UPDATE SET
+           content = EXCLUDED.content,
+           embedding = EXCLUDED.embedding,
+           metadata = EXCLUDED.metadata,
+           "sourceType" = EXCLUDED."sourceType",
+           "contentHash" = EXCLUDED."contentHash",
+           "documentId" = EXCLUDED."documentId",
+           "updatedAt" = NOW()`,
+        tenantId,
+        scopeType,
+        scopeId,
+        chunks[i] ?? '',
+        vecStr,
+        meta,
+        sourceKey ?? null,
+        sourceType,
+        i,
+        contentHash,
+        documentId,
+      );
+    }
+
+    if (sourceKey) {
+      await db.$executeRawUnsafe(
+        `DELETE FROM vector_documents
+         WHERE "tenantId" = $1
+           AND "scopeType" = $2
+           AND "scopeId" = $3
+           AND "sourceKey" = $4
+           AND "chunkIndex" >= $5`,
+        tenantId,
+        scopeType,
+        scopeId,
+        sourceKey,
+        chunks.length,
+      );
+    }
+
+    return chunks.length;
+  }
+
+  async search(
+    tenantId: string,
+    query: string,
+    topK = 5,
+    scoreThreshold = 0.5,
+    opts?: { scopeType?: string; scopeId?: string },
+  ): Promise<VectorSearchResult[]> {
+    const queryEmb = await this.embedder.embed(query);
+    const vecStr = `[${queryEmb.join(',')}]`;
+    const scopeType = opts?.scopeType ?? 'TENANT';
+    const scopeId = opts?.scopeId ?? tenantId;
+    const db = this.prisma as {
+      $queryRawUnsafe: (query: string, ...args: unknown[]) => Promise<unknown[]>;
+    };
+
+    const results = await db.$queryRawUnsafe(
+      `SELECT content, metadata, "sourceKey", "sourceType", "chunkIndex",
+              1 - (embedding <=> $1::vector) AS score
+       FROM vector_documents
+       WHERE "tenantId" = $2
+         AND "scopeType" = $3
+         AND "scopeId" = $4
+         AND embedding IS NOT NULL
+         AND 1 - (embedding <=> $1::vector) >= $5
+       ORDER BY embedding <=> $1::vector
+       LIMIT $6`,
+      vecStr,
+      tenantId,
+      scopeType,
+      scopeId,
+      scoreThreshold,
+      topK,
+    );
+
+    return (results as Record<string, unknown>[]).map((r) => ({
+      content: String(r['content'] ?? ''),
+      score: Number(r['score'] ?? 0),
+      metadata: (r['metadata'] as Record<string, unknown>) ?? undefined,
+      sourceKey: r['sourceKey'] ? String(r['sourceKey']) : undefined,
+      sourceType: String(r['sourceType'] ?? 'DOCUMENT'),
+      chunkIndex: Number(r['chunkIndex'] ?? 0),
+    }));
+  }
+
+  async delete(tenantId: string, sourceKey: string, opts?: { scopeType?: string; scopeId?: string }): Promise<number> {
+    const db = this.prisma as { $executeRawUnsafe: (query: string, ...args: unknown[]) => Promise<number> };
+    const scopeType = opts?.scopeType ?? 'TENANT';
+    const scopeId = opts?.scopeId ?? tenantId;
+    return db.$executeRawUnsafe(
+      `DELETE FROM vector_documents WHERE "tenantId" = $1 AND "scopeType" = $2 AND "scopeId" = $3 AND "sourceKey" = $4`,
+      tenantId,
+      scopeType,
+      scopeId,
+      sourceKey,
+    );
+  }
+}
+
+// ─── Factory ────────────────────────────────────────────────────────────────
+
+let _vectorAdapter: VectorMemoryAdapter | null = null;
+
+export function getVectorMemoryAdapter(): VectorMemoryAdapter {
+  if (_vectorAdapter) return _vectorAdapter;
+
+  const allowFallback = process.env['MEMORY_ALLOW_IN_MEMORY_FALLBACK'] === 'true'
+    || process.env['NODE_ENV'] !== 'production';
+
+  try {
+    // Try loading Prisma for pgvector
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const dbModule = require('@jak-swarm/db');
+    const prisma = dbModule.prisma;
+
+    if (prisma) {
+      // Test if pgvector extension is available by attempting a query
+      _vectorAdapter = new PgVectorAdapter(prisma);
+      console.info('[vector] Using pgvector adapter (PostgreSQL).');
+      return _vectorAdapter;
+    }
+  } catch {
+    // pgvector or Prisma not available
+  }
+
+  if (!allowFallback) {
+    throw new Error('[vector] Persistent vector store required but database is unavailable.');
+  }
+
+  console.warn('[vector] pgvector not available — using in-memory vector search (non-persistent).');
+  _vectorAdapter = new InMemoryVectorAdapter();
+  return _vectorAdapter;
+}
+
+export function resetVectorMemoryAdapter(): void {
+  _vectorAdapter = null;
+}
+
+function hashString(input: string): string {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { createHash } = require('crypto') as typeof import('crypto');
+  return createHash('sha256').update(input).digest('hex');
+}

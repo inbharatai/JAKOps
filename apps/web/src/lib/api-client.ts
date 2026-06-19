@@ -1,0 +1,2119 @@
+import type {
+  ApiError,
+  ApprovalRequest,
+  Integration,
+  PaginatedResult,
+  Workflow,
+  WorkflowCreateResponse,
+  WorkflowFollowupResponse,
+} from '@/types';
+import { createClient } from './supabase';
+import { clearToken, getRawToken } from './auth';
+
+/**
+ * Extract a human-readable error message from an API error or JS Error.
+ * API errors are thrown as plain objects { message, code, status }, not Error instances,
+ * so `err instanceof Error` is always false for them. This utility handles both cases.
+ */
+export function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === 'object' && 'message' in err) return String((err as { message: unknown }).message);
+  return 'Unknown error';
+}
+
+/**
+ * Resolve the API base URL with a strict production guard (P0-A fix).
+ *
+ * Behavior:
+ *   - If `NEXT_PUBLIC_API_URL` is set, use it verbatim (trimmed).
+ *   - In development (`NODE_ENV !== 'production'`), default to
+ *     `http://localhost:4000` so the local dev loop keeps working.
+ *   - In production with `NEXT_PUBLIC_API_URL` missing OR pointing at
+ *     localhost / 127.0.0.1, surface the misconfiguration loudly:
+ *     console.error on every page load + every API call returns a
+ *     structured `MISCONFIGURED_API_URL` error. We deliberately do NOT
+ *     silently fall back — that's how jakswarm.com shipped looking like
+ *     a working product while every dashboard fetch was broken.
+ *
+ * This guard runs on the client. The dashboard wraps `request()` with
+ * a top-level catch that surfaces a "Backend not configured" banner
+ * instead of letting buttons silently fail.
+ */
+const ENV_API_URL = process.env['NEXT_PUBLIC_API_URL']?.trim();
+const IS_PROD = process.env['NODE_ENV'] === 'production';
+
+function isLocalhost(url: string): boolean {
+  return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?(\/|$)/i.test(url);
+}
+
+function resolveBaseUrl(): { url: string; misconfigured: boolean; reason?: string } {
+  if (ENV_API_URL) {
+    if (IS_PROD && isLocalhost(ENV_API_URL)) {
+      return {
+        url: ENV_API_URL,
+        misconfigured: true,
+        reason: 'NEXT_PUBLIC_API_URL points at localhost in a production build',
+      };
+    }
+    return { url: ENV_API_URL, misconfigured: false };
+  }
+  if (IS_PROD) {
+    return {
+      url: 'http://localhost:4000',
+      misconfigured: true,
+      reason: 'NEXT_PUBLIC_API_URL is not set in production — set it in your Vercel project env vars to your deployed Railway API URL (e.g. https://your-railway-api-domain)',
+    };
+  }
+  // Development default — keeps the local dev loop working.
+  return { url: 'http://localhost:4000', misconfigured: false };
+}
+
+const RESOLVED = resolveBaseUrl();
+const BASE_URL = RESOLVED.url;
+export const API_MISCONFIGURED = RESOLVED.misconfigured;
+export const API_MISCONFIGURED_REASON = RESOLVED.reason ?? null;
+
+/**
+ * Single source of truth for the API base URL. Use this from EVERY
+ * place that needs to call the API — never re-implement the
+ * `NEXT_PUBLIC_API_URL ?? 'http://localhost:4000'` fallback inline.
+ * Inline fallbacks bypass the production-misconfig guard above and
+ * were the root cause of the jakswarm.com dashboard silently calling
+ * localhost in production.
+ *
+ * Reads as a function (not a constant) so server-rendered + client-
+ * rendered components both pick up the same value at the right time.
+ */
+export function getApiBaseUrl(): string {
+  return BASE_URL;
+}
+
+export function ensureApiConfigured(): void {
+  if (!API_MISCONFIGURED) return;
+  throw {
+    message:
+      'Backend API is not configured. ' + (API_MISCONFIGURED_REASON ?? ''),
+    code: 'MISCONFIGURED_API_URL',
+    status: 503,
+  } as ApiError;
+}
+
+export function buildApiUrl(path: string): string {
+  ensureApiConfigured();
+  return `${BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+if (RESOLVED.misconfigured && typeof window !== 'undefined') {
+  // eslint-disable-next-line no-console -- intentional surface for misconfig
+  console.error(
+    '[api-client] Production-build misconfiguration: ' + RESOLVED.reason +
+      '. Dashboard API calls will be rejected with MISCONFIGURED_API_URL.',
+  );
+}
+
+let cachedToken: string | null = null;
+let tokenExpiresAt = 0;
+const TOKEN_CACHE_TTL_MS = 30_000; // 30 seconds
+
+/**
+ * DEV-ONLY auth bypass — when `NEXT_PUBLIC_JAK_DEV_AUTH_BYPASS=1`,
+ * `getToken` skips Supabase entirely and returns the literal bypass
+ * token the API recognizes (paired with `JAK_DEV_AUTH_BYPASS=1` on
+ * the API side — see apps/api/src/plugins/auth.plugin.ts).
+ *
+ * Three layers of safety match the API contract:
+ *   - The flag is `NEXT_PUBLIC_*` so it only ships when the developer
+ *     explicitly sets it; production builds don't carry it.
+ *   - Even if the flag accidentally ships, the API requires
+ *     `NODE_ENV !== 'production'` AND its own server-side flag set,
+ *     so the bypass token is rejected on any prod build.
+ *   - The token is the literal `jak-dev-bypass` — caller must know
+ *     the magic string, no random JWT will work.
+ */
+const DEV_BYPASS_ACTIVE = process.env['NEXT_PUBLIC_JAK_DEV_AUTH_BYPASS'] === '1';
+const DEV_BYPASS_TOKEN = 'jak-dev-bypass';
+
+async function getToken(): Promise<string | null> {
+  if (typeof window === 'undefined') return null;
+  if (DEV_BYPASS_ACTIVE) return DEV_BYPASS_TOKEN;
+  const jakToken = getRawToken();
+  if (jakToken) return jakToken;
+  const now = Date.now();
+  if (cachedToken && now < tokenExpiresAt) return cachedToken;
+  try {
+    const supabase = createClient();
+    const { data } = await supabase.auth.getSession();
+    cachedToken = data?.session?.access_token ?? null;
+    tokenExpiresAt = now + TOKEN_CACHE_TTL_MS;
+    return cachedToken;
+  } catch {
+    cachedToken = null;
+    tokenExpiresAt = 0;
+    return null;
+  }
+}
+
+function clearSession(): void {
+  if (typeof window === 'undefined') return;
+  cachedToken = null;
+  tokenExpiresAt = 0;
+  clearToken();
+  const supabase = createClient();
+  supabase.auth.signOut();
+  window.location.href = '/login';
+}
+
+function normalizeErrorDetails(value: unknown): Record<string, string[]> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+
+  const normalized: Record<string, string[]> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (Array.isArray(raw)) {
+      normalized[key] = raw.map((item) => String(item));
+    }
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<T> {
+  // P0-A fix — refuse to fire production fetches at localhost. The
+  // dashboard catches MISCONFIGURED_API_URL and surfaces a "Backend
+  // not configured" banner instead of letting buttons silently fail
+  // against a non-existent localhost API.
+  const url = buildApiUrl(path);
+  const token = await getToken();
+
+  const headers: HeadersInit = {
+    Accept: 'application/json',
+  };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const options: RequestInit = {
+    method,
+    headers,
+  };
+
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    options.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(url, options);
+
+  if (response.status === 401) {
+    clearSession();
+    throw { message: 'Unauthorized', code: 'UNAUTHORIZED', status: 401 } as ApiError;
+  }
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  const json = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const envelope = (json && typeof json === 'object' ? json : null) as
+      | { error?: { code?: string; message?: string; details?: unknown }; code?: string; message?: string; details?: unknown }
+      | null;
+
+    const error: ApiError = {
+      message: envelope?.error?.message ?? envelope?.message ?? response.statusText ?? 'Request failed',
+      code: envelope?.error?.code ?? envelope?.code ?? 'UNKNOWN_ERROR',
+      status: response.status,
+      details: normalizeErrorDetails(envelope?.error?.details ?? envelope?.details),
+    };
+    throw error;
+  }
+
+  return json as T;
+}
+
+function unwrapApiData<T>(payload: unknown): T {
+  if (
+    payload &&
+    typeof payload === 'object' &&
+    'success' in payload &&
+    (payload as { success?: unknown }).success === true &&
+    'data' in payload
+  ) {
+    return (payload as { data: T }).data;
+  }
+
+  return payload as T;
+}
+
+async function requestData<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<T> {
+  const payload = await request<unknown>(method, path, body);
+  return unwrapApiData<T>(payload);
+}
+
+export const apiClient = {
+  get<T>(path: string): Promise<T> {
+    return request<T>('GET', path);
+  },
+
+  post<T>(path: string, body?: unknown): Promise<T> {
+    return request<T>('POST', path, body);
+  },
+
+  patch<T>(path: string, body?: unknown): Promise<T> {
+    return request<T>('PATCH', path, body);
+  },
+
+  put<T>(path: string, body?: unknown): Promise<T> {
+    return request<T>('PUT', path, body);
+  },
+
+  delete<T>(path: string): Promise<T> {
+    return request<T>('DELETE', path);
+  },
+};
+
+/** SWR-compatible fetcher. Use as: useSWR<T>(key, fetcher) */
+export function fetcher<T>(url: string): Promise<T> {
+  return apiClient.get<T>(url);
+}
+
+/**
+ * Browser-operator API — real Playwright-backed sessions.
+ * Backend at apps/api/src/routes/browser-operator.routes.ts.
+ */
+export const browserSessionsApi = {
+  list: () => apiClient.get<unknown>('/browser-sessions'),
+  start: (body: { platform: string; initialUrl: string; workflowId?: string }) =>
+    apiClient.post<unknown>('/browser-sessions', body),
+  observe: (sessionId: string) => apiClient.get<unknown>(`/browser-sessions/${sessionId}`),
+  propose: (sessionId: string, action: { kind: string; description: string; payload: Record<string, unknown> }) =>
+    apiClient.post<unknown>(`/browser-sessions/${sessionId}/propose`, { action }),
+  execute: (
+    sessionId: string,
+    action: { kind: string; description: string; payload: Record<string, unknown> },
+    approvalId: string,
+  ) => apiClient.post<unknown>(`/browser-sessions/${sessionId}/execute`, { action, approvalId }),
+  end: (sessionId: string) => apiClient.delete<unknown>(`/browser-sessions/${sessionId}`),
+  /**
+   * Sprint 6 Part C — platform-specific adapter dispatch. Drives the
+   * underlying LinkedIn / Instagram / YouTube / Meta adapter methods.
+   */
+  platformAction: (
+    sessionId: string,
+    platform: string,
+    body:
+      | { action: 'detect_login' }
+      | { action: 'build_draft'; topic: string; tone?: 'professional' | 'casual' | 'enthusiastic' }
+      | { action: 'record_publish'; draft: Record<string, unknown>; approvalId: string },
+  ) => apiClient.post<unknown>(`/browser-sessions/${sessionId}/platform/${platform}/action`, body),
+};
+
+/**
+ * Sprint 6 Part D — Social drafts API.
+ * Backend: apps/api/src/routes/social-drafts.routes.ts. Stateless;
+ * uses the platform adapters' buildDraft() methods. NEVER publishes.
+ */
+export const socialDraftsApi = {
+  generate: (body: {
+    platform: 'LINKEDIN' | 'INSTAGRAM' | 'YOUTUBE_STUDIO' | 'META_BUSINESS_SUITE';
+    topic: string;
+    tone?: 'professional' | 'casual' | 'enthusiastic';
+  }) => apiClient.post<unknown>('/social-drafts', body),
+};
+
+/**
+ * Sprint 6 Part E — Tool installer API.
+ * Backend: apps/api/src/routes/tool-installer.routes.ts. Real
+ * subprocess execution via SandboxedInstaller; allowlisted only.
+ */
+export const toolInstallerApi = {
+  detect: (task: string) => apiClient.post<unknown>('/tool-installer/detect', { task }),
+  plan: (toolName: string, purpose: string) =>
+    apiClient.post<unknown>('/tool-installer/plan', { toolName, purpose }),
+  execute: (toolName: string, purpose: string, approvalId: string) =>
+    apiClient.post<unknown>('/tool-installer/execute', { toolName, purpose, approvalId }),
+};
+
+/** SWR-compatible fetcher that unwraps { success: true, data } envelopes. */
+export function dataFetcher<T>(url: string): Promise<T> {
+  return requestData<T>('GET', url);
+}
+
+/** Generic fetch helper for use in components */
+export function apiFetch<T>(path: string, options?: { method?: string; body?: unknown }): Promise<T> {
+  const method = options?.method ?? 'GET';
+  return request<T>(method, path, options?.body);
+}
+
+/** Generic fetch helper that unwraps { success: true, data } envelopes. */
+export function apiDataFetch<T>(path: string, options?: { method?: string; body?: unknown }): Promise<T> {
+  const method = options?.method ?? 'GET';
+  return requestData<T>(method, path, options?.body);
+}
+
+// ─── Typed API endpoints ──────────────────────────────────────────────────────
+// NOTE: Routes are registered on the Fastify server without an /api prefix.
+// BASE_URL already points to the API server (http://localhost:4000).
+
+export const authApi = {
+  /** POST /auth/login */
+  login: (email: string, password: string) =>
+    apiClient.post<unknown>('/auth/login', { email, password }),
+
+  /** POST /auth/register */
+  register: (data: {
+    email: string;
+    password: string;
+    name: string;
+    tenantName: string;
+    industry?: string;
+  }) => apiClient.post<unknown>('/auth/register', data),
+
+  /** GET /auth/me */
+  me: () => apiClient.get<unknown>('/auth/me'),
+};
+
+export const workflowApi = {
+  /** GET /workflows?page=&limit=&status= */
+  list: (params?: Record<string, string | number>) => {
+    const qs = params
+      ? '?' + new URLSearchParams(params as Record<string, string>).toString()
+      : '';
+    return apiDataFetch<PaginatedResult<Workflow>>(`/workflows${qs}`);
+  },
+
+  /** GET /workflows/:id */
+  get: (id: string) => apiDataFetch<Workflow>(`/workflows/${id}`),
+
+  /**
+    * POST /workflows.
+    *
+    * Returns one of:
+    * - workflow_created: canonical new-workflow response (typically 202)
+    * - followup_executed: short follow-up command routed to active workflow (typically 200)
+   */
+  create: (goal: string, industry?: string, roleModes?: string[], conversationId?: string) =>
+    apiDataFetch<WorkflowCreateResponse>(
+      '/workflows',
+      { method: 'POST', body: { goal, industry, roleModes, conversationId } },
+    ),
+
+  /**
+   * POST /workflows/:id/resume — send approval decision to resume a PAUSED workflow.
+   * decision: 'APPROVED' | 'REJECTED' | 'DEFERRED'
+   */
+  resume: (id: string, decision: 'APPROVED' | 'REJECTED' | 'DEFERRED', comment?: string) =>
+    apiDataFetch<unknown>(`/workflows/${id}/resume`, { method: 'POST', body: { decision, comment } }),
+
+  /** DELETE /workflows/:id — cancel a running workflow */
+  cancel: (id: string) => apiDataFetch<unknown>(`/workflows/${id}`, { method: 'DELETE' }),
+
+  /** Pause a running workflow (pauses between nodes) */
+  pause: (id: string) => apiDataFetch<unknown>(`/workflows/${id}/pause`, { method: 'POST' }),
+
+  /** Resume a paused workflow */
+  unpause: (id: string) => apiDataFetch<unknown>(`/workflows/${id}/unpause`, { method: 'POST' }),
+
+  /** Alias: stop = cancel */
+  stop: (id: string) => apiDataFetch<unknown>(`/workflows/${id}/stop`, { method: 'POST' }),
+  stopAll: async () => {
+    const res = await workflowApi.list({ status: 'RUNNING' });
+    const running = res.items ?? [];
+    await Promise.allSettled(running.map(w => workflowApi.cancel(w.id)));
+  },
+
+  /** GET /workflows/:id/traces */
+  traces: (id: string) => apiDataFetch<unknown>(`/workflows/${id}/traces`),
+
+  /** GET /workflows/:id/approvals */
+  approvals: (id: string) => apiDataFetch<ApprovalRequest[]>(`/workflows/${id}/approvals`),
+};
+
+export function isWorkflowFollowupResponse(value: WorkflowCreateResponse): value is WorkflowFollowupResponse {
+  return value.kind === 'followup_executed' && typeof value.workflowId === 'string';
+}
+
+export function getWorkflowIdFromCreateResponse(value: WorkflowCreateResponse): string | null {
+  if (isWorkflowFollowupResponse(value)) {
+    return value.workflowId;
+  }
+  if (typeof value.workflowId === 'string' && value.workflowId.length > 0) {
+    return value.workflowId;
+  }
+  if (typeof value.id === 'string' && value.id.length > 0) {
+    return value.id;
+  }
+  return null;
+}
+
+export const approvalApi = {
+  /** GET /approvals?status=PENDING */
+  list: (status?: string) =>
+    apiDataFetch<PaginatedResult<ApprovalRequest>>(`/approvals${status ? `?status=${status}` : ''}`),
+
+  /** GET /approvals/:id */
+  get: (id: string) => apiDataFetch<ApprovalRequest>(`/approvals/${id}`),
+
+  /**
+   * POST /approvals/:id/decide — unified decision endpoint.
+   * decision: 'APPROVED' | 'REJECTED' | 'DEFERRED'
+   */
+  decide: (id: string, decision: 'APPROVED' | 'REJECTED' | 'DEFERRED', comment?: string) =>
+    apiDataFetch<ApprovalRequest>(`/approvals/${id}/decide`, { method: 'POST', body: { decision, comment } }),
+
+  approve: (id: string, comment?: string) =>
+    apiDataFetch<ApprovalRequest>(`/approvals/${id}/decide`, { method: 'POST', body: { decision: 'APPROVED', comment } }),
+
+  reject: (id: string, comment?: string) =>
+    apiDataFetch<ApprovalRequest>(`/approvals/${id}/decide`, { method: 'POST', body: { decision: 'REJECTED', comment } }),
+
+  /** POST /approvals/:id/defer */
+  defer: (id: string, comment?: string) =>
+    apiDataFetch<ApprovalRequest>(`/approvals/${id}/defer`, { method: 'POST', body: { comment } }),
+
+  /**
+   * POST /approvals/:id/sandbox-test — Item B (OpenClaw-inspired Phase 1)
+   * dry-run preview. Returns structural validation + (optional) sandbox
+   * exec output. Never mutates the approval row.
+   */
+  sandboxTest: (id: string) =>
+    apiDataFetch<{
+      approvalId: string;
+      toolName: string | null;
+      externalService: string | null;
+      inputValid: boolean;
+      inputIssues: string[];
+      inputSummary: Record<string, unknown>;
+      sandboxOutcome: 'ok' | 'not_configured' | 'failed';
+      sandboxLog?: string;
+      proposedDataHashEcho: string;
+      note?: string;
+    }>(`/approvals/${id}/sandbox-test`, { method: 'POST' }),
+};
+
+export const traceApi = {
+  /** GET /traces?workflowId=&agentRole=&page= */
+  list: (params?: Record<string, string | number>) => {
+    const qs = params
+      ? '?' + new URLSearchParams(params as Record<string, string>).toString()
+      : '';
+    return apiClient.get<unknown>(`/traces${qs}`);
+  },
+
+  /** GET /traces/:id */
+  get: (id: string) => apiClient.get<unknown>(`/traces/${id}`),
+};
+
+export const memoryApi = {
+  /** GET /memory?type=&key= */
+  list: (params?: Record<string, string | number>) => {
+    const qs = params
+      ? '?' + new URLSearchParams(params as Record<string, string>).toString()
+      : '';
+    return apiDataFetch<unknown>(`/memory${qs}`);
+  },
+
+  /** PUT /memory/:key */
+  create: (entry: { type: string; key: string; value: unknown; expiresAt?: string }) =>
+    apiDataFetch<unknown>(`/memory/${encodeURIComponent(entry.key)}`, {
+      method: 'PUT',
+      body: {
+        value: entry.value,
+        type: entry.type,
+        ttl: entry.expiresAt,
+      },
+    }),
+
+  /** PUT /memory/:key */
+  update: (key: string, value: unknown, type?: string, expiresAt?: string) =>
+    apiDataFetch<unknown>(`/memory/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      body: {
+        value,
+        ...(type ? { type } : {}),
+        ...(expiresAt ? { ttl: expiresAt } : {}),
+      },
+    }),
+
+  /** DELETE /memory/:key */
+  delete: (key: string) => apiDataFetch<unknown>(`/memory/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+};
+
+export const skillApi = {
+  /** GET /skills?status=&tier= */
+  list: (params?: Record<string, string>) => {
+    const qs = params
+      ? '?' + new URLSearchParams(params).toString()
+      : '';
+    return apiClient.get<unknown>(`/skills${qs}`);
+  },
+
+  /** GET /skills/:id */
+  get: (id: string) => apiClient.get<unknown>(`/skills/${id}`),
+
+  /** POST /skills/propose — propose a new skill */
+  propose: (skill: Record<string, unknown>) => apiDataFetch<unknown>('/skills/propose', { method: 'POST', body: skill }),
+
+  /** POST /skills/:id/approve */
+  approve: (id: string) => apiClient.post<unknown>(`/skills/${id}/approve`, {}),
+
+  /** POST /skills/:id/reject */
+  reject: (id: string, reason: string) =>
+    apiClient.post<unknown>(`/skills/${id}/reject`, { reason }),
+};
+
+export const toolApi = {
+  /** GET /tools */
+  list: () => apiClient.get<unknown>('/tools'),
+
+  /** POST /tools/:toolName/execute */
+  execute: (toolName: string, input: unknown) =>
+    apiClient.post<unknown>(`/tools/${toolName}/execute`, input),
+};
+
+// ─── Documents API (Track 2) ────────────────────────────────────────────────
+
+export interface TenantDocument {
+  id: string;
+  tenantId: string;
+  uploadedBy: string | null;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  storageKey: string;
+  contentHash: string | null;
+  status: 'PENDING' | 'INDEXED' | 'FAILED' | 'DELETED';
+  ingestionError: string | null;
+  tags: string[];
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+  /** Included only on GET /documents/:id — short-lived signed URL. */
+  signedUrl?: string;
+  signedUrlExpiresIn?: number;
+}
+
+export interface DocumentListResponse {
+  items: TenantDocument[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export const documentApi = {
+  /** GET /documents — paginated list of tenant documents. */
+  list: (params?: { limit?: number; offset?: number; status?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.limit) q.set('limit', String(params.limit));
+    if (params?.offset) q.set('offset', String(params.offset));
+    if (params?.status) q.set('status', params.status);
+    const suffix = q.toString() ? `?${q.toString()}` : '';
+    return apiFetch<{ success: true; data: DocumentListResponse }>(`/documents${suffix}`);
+  },
+
+  /** GET /documents/:id — metadata + fresh signed URL. */
+  get: (id: string) =>
+    apiFetch<{ success: true; data: TenantDocument }>(`/documents/${id}`),
+
+  /**
+   * POST /documents/upload — multipart/form-data.
+   *
+   * Uses raw fetch instead of the JSON-default `apiClient.post` because the
+   * multipart body must carry a FormData payload + browser-managed Content-Type
+   * boundary. Auth header is injected via getToken() the same way other calls do.
+   */
+  upload: async (file: File, opts?: { tags?: string[]; metadata?: Record<string, unknown> }) => {
+    const url = buildApiUrl('/documents/upload');
+    const token = await getToken();
+    const formData = new FormData();
+    formData.append('file', file);
+    if (opts?.tags && opts.tags.length > 0) {
+      formData.append('tags', opts.tags.join(','));
+    }
+    if (opts?.metadata) {
+      formData.append('metadataJson', JSON.stringify(opts.metadata));
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: { message: 'Upload failed' } }));
+      throw {
+        message: err.error?.message ?? 'Upload failed',
+        code: err.error?.code ?? 'UPLOAD_FAILED',
+        status: response.status,
+      } as ApiError;
+    }
+
+    return response.json() as Promise<{ success: true; data: TenantDocument }>;
+  },
+
+  /** DELETE /documents/:id — removes storage object + cascades chunk cleanup. */
+  delete: (id: string) =>
+    apiClient.delete<{ success: true; data: { id: string; deleted: true } }>(
+      `/documents/${id}`,
+    ),
+};
+
+export const voiceApi = {
+  /**
+   * Alias for createSession — used by the VoiceInput hook.
+   * @deprecated use createSession
+   */
+  getSessionConfig: (options?: { language?: string; voice?: string; workflowId?: string }) =>
+    apiClient.post<unknown>('/voice/sessions', options ?? {}),
+
+  /**
+   * POST /voice/sessions — create a voice session.
+   * Returns { sessionId, webRtcConfig, expiresInSeconds }
+   */
+  createSession: (options?: { language?: string; voice?: string; workflowId?: string }) =>
+    apiClient.post<{
+      success: true;
+      data: {
+        sessionId: string;
+        webRtcConfig: Record<string, unknown>;
+        expiresInSeconds: number;
+      };
+    }>('/voice/sessions', options ?? {}),
+
+  /**
+   * GET /voice/sessions/:sessionId/token — obtain an ephemeral WebRTC token.
+   * The browser uses this token to connect directly to OpenAI Realtime.
+   */
+  getToken: (sessionId: string) =>
+    apiClient.get<{
+      success: true;
+      data: {
+        sessionId: string;
+        clientToken: string;
+        model: string;
+        expiresAt: string;
+        isMock: boolean;
+      };
+    }>(`/voice/sessions/${sessionId}/token`),
+
+  /** DELETE /voice/sessions/:sessionId — end a session */
+  endSession: (sessionId: string) =>
+    apiClient.delete<unknown>(`/voice/sessions/${sessionId}`),
+
+  /** GET /voice/sessions/:sessionId/transcript */
+  getTranscript: (sessionId: string) =>
+    apiClient.get<unknown>(`/voice/sessions/${sessionId}/transcript`),
+};
+
+// ─── Admin API ────────────────────────────────────────────────────────────────
+
+export const integrationApi = {
+  list: () => apiDataFetch<Integration[]>('/integrations'),
+  disconnect: (id: string) => apiDataFetch<void>(`/integrations/${id}`, { method: 'DELETE' }),
+  connect: (provider: string, credentials: Record<string, string>) =>
+    apiDataFetch<{ id: string; provider: string; status: string; toolsRegistered: string[] }>(
+      '/integrations/connect',
+      { method: 'POST', body: { provider, credentials } },
+    ),
+  getProviderInfo: (provider: string) =>
+    apiDataFetch<{
+      name: string;
+      description: string;
+      credentialFields: Array<{ key: string; label: string; placeholder: string; type: string; helpUrl?: string }>;
+      setupInstructions: string;
+      isMcp?: boolean;
+      maturity?: 'production-ready' | 'beta' | 'partial' | 'placeholder';
+      note?: string;
+    }>(
+      `/integrations/providers/${provider}`,
+    ),
+  test: (id: string) =>
+    apiDataFetch<{ connected: boolean; toolCount: number; tools: string[] }>(
+      `/integrations/${id}/test`,
+      { method: 'POST' },
+    ),
+  // Start an OAuth authorization. Returns the provider's auth URL the browser
+  // should be redirected to. The callback URL is server-side config; the
+  // frontend just follows the URL we hand back. Supports every provider in
+  // the backend's OAUTH_PROVIDERS registry (Gmail, Slack, GitHub, Notion,
+  // Linear as of Phase A). Returns 503 NOT_CONFIGURED if the provider's
+  // client_id / client_secret env vars aren't set on the deployment.
+  oauthAuthorize: (provider: string) =>
+    apiDataFetch<{ authUrl: string; state: string; provider: string }>(
+      `/integrations/oauth/${provider}/authorize`,
+      // Fastify enforces media-type negotiation for POST routes; send an
+      // explicit JSON body to avoid 415 on body-less requests.
+      { method: 'POST', body: {} },
+    ),
+
+  // List which providers have an OAuth implementation configured on THIS
+  // deployment (both client_id and client_secret present). Used by the
+  // ConnectModal to decide whether to render "Sign in with X" or fall back
+  // to the credential-paste form.
+  listOAuthProviders: () =>
+    apiDataFetch<Array<{ id: string; label: string; configured: boolean }>>(
+      '/integrations/oauth/providers',
+    ),
+};
+
+export const whatsappApi = {
+  getNumber: () => apiDataFetch<{ number: string | null; status: string; verificationCode?: string | null; expiresAt?: string | null; verifiedAt?: string | null }>('/whatsapp/number'),
+  setNumber: (number: string) => apiDataFetch<{ number: string; status: string; verificationCode?: string | null; expiresAt?: string | null; verifiedAt?: string | null }>(
+    '/whatsapp/number',
+    { method: 'POST', body: { number } },
+  ),
+  clearNumber: () => apiDataFetch<void>('/whatsapp/number', { method: 'DELETE' }),
+};
+
+export const onboardingApi = {
+  getState: () =>
+    apiDataFetch<{ completedSteps: string[]; dismissed: boolean }>('/onboarding/state'),
+  updateState: (body: { completedSteps?: string[]; dismissed?: boolean }) =>
+    apiDataFetch<{ completedSteps: string[]; dismissed: boolean }>('/onboarding/state', { method: 'POST', body }),
+};
+
+export const approvalsApi = {
+  list: (params?: { status?: string }) => {
+    const qs = params?.status ? `?status=${params.status}` : '';
+    return apiClient.get<unknown>(`/approvals${qs}`);
+  },
+  get: (id: string) => apiClient.get<unknown>(`/approvals/${id}`),
+  decide: (id: string, body: { decision: string; comment?: string }) =>
+    apiClient.post<unknown>(`/approvals/${id}/decide`, body),
+};
+
+export const adminApi = {
+  /** GET /tenants/current/settings */
+  getSettings: () => apiDataFetch<unknown>('/tenants/current/settings'),
+  updateSettings: (settings: unknown) =>
+    apiDataFetch<unknown>('/tenants/current/settings', { method: 'PATCH', body: settings }),
+
+  /** GET /tenants/current/users */
+  listUsers: () => apiDataFetch<unknown>('/tenants/current/users'),
+
+  /** Skills (via /skills routes) */
+  listSkills: (status?: string) =>
+    apiClient.get<unknown>(`/skills${status ? `?status=${status}` : ''}`),
+  approveSkill: (id: string) => apiClient.post<unknown>(`/skills/${id}/approve`, {}),
+  rejectSkill: (id: string, reason: string) =>
+    apiClient.post<unknown>(`/skills/${id}/reject`, { reason }),
+
+  /** Tools */
+  listTools: () => apiDataFetch<unknown>('/tools'),
+};
+
+// ─── Audit & Compliance v0 ─────────────────────────────────────────────
+//
+// Wraps GET /audit/log, /audit/workflows/:id/trail, /audit/reviewer-queue,
+// /audit/dashboard. All routes are tenant-scoped server-side; the client
+// just passes the bearer token. Returns are wrapped in `{success, data}`
+// envelopes by `apiDataFetch` (which unwraps `data`).
+
+export interface AuditLogEntry {
+  id: string;
+  tenantId: string;
+  userId: string | null;
+  action: string;
+  resource: string;
+  resourceId: string | null;
+  details: Record<string, unknown> | null;
+  severity: string;
+  createdAt: string;
+}
+
+export interface AuditLogPage {
+  items: AuditLogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface WorkflowTrailEvent {
+  at: string;
+  source: 'lifecycle' | 'trace' | 'approval' | 'artifact';
+  type: string;
+  details: Record<string, unknown>;
+}
+
+export interface WorkflowTrail {
+  workflow: { id: string; goal: string; status: string; startedAt: string; completedAt: string | null; totalCostUsd: number };
+  events: WorkflowTrailEvent[];
+  eventCount: number;
+}
+
+export interface ReviewerQueue {
+  workflowApprovals: { items: ApprovalRequest[]; total: number };
+  artifactApprovals: {
+    items: Array<{
+      id: string;
+      workflowId: string;
+      fileName: string;
+      artifactType: string;
+      sizeBytes: number | null;
+      producedBy: string;
+      createdAt: string;
+    }>;
+    total: number;
+  };
+  limit: number;
+  offset: number;
+}
+
+export interface AuditDashboard {
+  generatedAt: string;
+  windows: { day: string; week: string };
+  workflows: {
+    total: number;
+    byStatus: Array<{ status: string; count: number }>;
+    last24h: number;
+    last7d: number;
+  };
+  approvals: { byStatus: Array<{ status: string; count: number }> };
+  artifacts: {
+    available: boolean;
+    byType: Array<{ artifactType: string; count: number }>;
+    byApprovalState: Array<{ approvalState: string; count: number }>;
+    signedBundles: number;
+  };
+  actionsLast7d: Array<{ action: string; count: number }>;
+}
+
+export const auditApi = {
+  log: (params?: { limit?: number; offset?: number; action?: string; resource?: string; resourceId?: string; userId?: string; from?: string; to?: string; q?: string }) => {
+    const qs = params ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== '').map(([k, v]) => [k, String(v)])).toString() : '';
+    return apiDataFetch<AuditLogPage>(`/audit/log${qs}`);
+  },
+  workflowTrail: (workflowId: string) =>
+    apiDataFetch<WorkflowTrail>(`/audit/workflows/${workflowId}/trail`),
+  reviewerQueue: (params?: { limit?: number; offset?: number; riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(
+          Object.entries(params)
+            .filter(([, v]) => v !== undefined && v !== null && String(v).length > 0)
+            .map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : '';
+    return apiDataFetch<ReviewerQueue>(`/audit/reviewer-queue${qs}`);
+  },
+  dashboard: () => apiDataFetch<AuditDashboard>('/audit/dashboard'),
+};
+
+// ─── Audit & Compliance v1 ─────────────────────────────────────────────
+//
+// Wraps /compliance/* — control framework mapping (SOC 2 Type 2 etc.).
+// Built on top of the Audit & Compliance v0 audit log + reviewer surfaces.
+
+export interface ComplianceFramework {
+  slug: string;
+  name: string;
+  shortName: string;
+  issuer: string;
+  description: string;
+  version: string;
+}
+
+export interface ComplianceSubControl {
+  code: string;
+  title: string;
+  description: string;
+}
+
+export interface ComplianceControl {
+  id: string;
+  code: string;
+  category: string;
+  series: string;
+  title: string;
+  description: string;
+  autoRuleKey: string | null;
+  subControls: ComplianceSubControl[] | null;
+  evidenceCount: number;
+}
+
+export interface ComplianceFrameworkSummary {
+  framework: ComplianceFramework & { id: string };
+  controls: ComplianceControl[];
+  coverageCounts: { total: number; covered: number; uncovered: number; coveragePercent: number };
+}
+
+export interface ControlEvidenceItem {
+  id: string;
+  evidenceType: 'audit_log' | 'workflow' | 'approval' | 'artifact' | 'evidence_bundle';
+  evidenceId: string;
+  evidenceAt: string;
+  mappedBy: string;
+  mappingSource: 'auto' | 'manual';
+  notes: string | null;
+  createdAt: string;
+}
+
+export interface AutoMapResultClient {
+  tenantId: string;
+  frameworkSlug: string;
+  periodStart: string;
+  periodEnd: string;
+  controlsProcessed: number;
+  controlsWithRule: number;
+  controlsWithoutRule: number;
+  newMappingsCreated: number;
+  totalEvidenceConsidered: number;
+  perControl: Array<{ controlCode: string; ruleKey: string | null; created: number; total: number }>;
+  durationMs: number;
+}
+
+export interface AttestationResultClient {
+  attestationId: string;
+  artifactId: string;
+  bundleArtifactId?: string;
+  bundleSignature?: string;
+  framework: { slug: string; name: string; version: string };
+  periodStart: string;
+  periodEnd: string;
+  totalEvidence: number;
+  coveragePercent: number;
+  controlSummary: Array<{ controlCode: string; title: string; evidenceCount: number }>;
+  fileName: string;
+}
+
+export interface AttestationListItem {
+  id: string;
+  frameworkSlug: string;
+  frameworkName: string;
+  periodStart: string;
+  periodEnd: string;
+  totalEvidence: number;
+  coveragePercent: number;
+  artifactId: string | null;
+  generatedBy: string;
+  createdAt: string;
+}
+
+export const complianceApi = {
+  listFrameworks: () =>
+    apiDataFetch<{ frameworks: ComplianceFramework[] }>('/compliance/frameworks'),
+  framework: (slug: string, params?: { from?: string; to?: string }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v).map(([k, v]) => [k, String(v)])).toString()
+      : '';
+    return apiDataFetch<ComplianceFrameworkSummary>(`/compliance/frameworks/${slug}${qs}`);
+  },
+  controlEvidence: (slug: string, controlId: string, params?: { from?: string; to?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(
+          Object.entries(params)
+            .filter(([, v]) => v !== undefined && v !== null && String(v).length > 0)
+            .map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : '';
+    return apiDataFetch<{ items: ControlEvidenceItem[]; total: number; limit: number; offset: number }>(
+      `/compliance/frameworks/${slug}/controls/${controlId}/evidence${qs}`,
+    );
+  },
+  autoMap: (slug: string, body?: { periodStart?: string; periodEnd?: string }) =>
+    apiDataFetch<AutoMapResultClient>(`/compliance/frameworks/${slug}/auto-map`, { method: 'POST', body: body ?? {} }),
+  generateAttestation: (slug: string, body: { periodStart: string; periodEnd: string; sign?: boolean; metadata?: Record<string, unknown> }) =>
+    apiDataFetch<AttestationResultClient>(`/compliance/frameworks/${slug}/attestations`, { method: 'POST', body }),
+  listAttestations: (params?: { framework?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(
+          Object.entries(params)
+            .filter(([, v]) => v !== undefined && v !== null && String(v).length > 0)
+            .map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : '';
+    return apiDataFetch<{ items: AttestationListItem[]; total: number }>(`/compliance/attestations${qs}`);
+  },
+  // Manual evidence — human-curated rows that supplement the auto-mapper
+  createManualEvidence: (body: { controlId: string; title: string; description: string; attachedArtifactId?: string; evidenceAt?: string }) =>
+    apiDataFetch<{ id: string; mappingId: string }>('/compliance/manual-evidence', { method: 'POST', body }),
+  listManualEvidence: (controlId: string, params?: { limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(
+          Object.entries(params)
+            .filter(([, v]) => v !== undefined && v !== null && String(v).length > 0)
+            .map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : '';
+    return apiDataFetch<{ items: Array<{ id: string; title: string; description: string; attachedArtifactId: string | null; createdBy: string; evidenceAt: string; createdAt: string }>; total: number }>(`/compliance/controls/${controlId}/manual-evidence${qs}`);
+  },
+  deleteManualEvidence: (id: string) =>
+    apiDataFetch<{ deleted: boolean; id: string }>(`/compliance/manual-evidence/${id}`, { method: 'DELETE' }),
+  // Scheduled attestations — recurring auto-generation
+  listSchedules: () =>
+    apiDataFetch<{ items: Array<ScheduledAttestationItem> }>('/compliance/schedules'),
+  createSchedule: (body: { frameworkSlug: string; cronExpression: string; windowDays: number; signBundles: boolean; active?: boolean; metadata?: Record<string, unknown> }) =>
+    apiDataFetch<{ schedule: ScheduledAttestationItem }>('/compliance/schedules', { method: 'POST', body }),
+  updateSchedule: (id: string, body: { cronExpression?: string; windowDays?: number; signBundles?: boolean; active?: boolean; metadata?: Record<string, unknown> }) =>
+    apiDataFetch<{ schedule: ScheduledAttestationItem }>(`/compliance/schedules/${id}`, { method: 'PATCH', body }),
+  deleteSchedule: (id: string) =>
+    apiDataFetch<{ deleted: boolean; id: string }>(`/compliance/schedules/${id}`, { method: 'DELETE' }),
+};
+
+// ─── Audit & Compliance v2 — engagement runs ───────────────────────────
+//
+// Wraps /audit/runs/* — full audit engagements with control tests,
+// exceptions, workpapers, reviewer approval, signed final pack.
+// Built on top of the v1 framework mapping + v0 audit log surfaces.
+
+export type AuditRunStatusClient =
+  | 'PLANNING' | 'PLANNED' | 'MAPPING' | 'TESTING' | 'REVIEWING'
+  | 'READY_TO_PACK' | 'FINAL_PACK' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+
+export interface AuditRunSummary {
+  id: string;
+  tenantId: string;
+  userId: string;
+  frameworkSlug: string;
+  title: string;
+  scope: string | null;
+  periodStart: string;
+  periodEnd: string;
+  status: AuditRunStatusClient;
+  riskSummary: 'low' | 'medium' | 'high' | 'critical' | null;
+  coveragePercent: number | null;
+  finalPackArtifactId: string | null;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ControlTestRow {
+  id: string;
+  controlId: string;
+  controlCode: string;
+  controlTitle: string;
+  testProcedure: string | null;
+  status: string;
+  result: 'pass' | 'fail' | 'exception' | 'needs_evidence' | null;
+  rationale: string | null;
+  confidence: number | null;
+  evidenceCount: number;
+  exceptionId: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface AuditExceptionRow {
+  id: string;
+  controlId: string;
+  controlCode: string;
+  controlTestId: string | null;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  status: string;
+  description: string;
+  cause: string | null;
+  impact: string | null;
+  remediationPlan: string | null;
+  remediationOwner: string | null;
+  remediationDueDate: string | null;
+  reviewerStatus: string | null;
+  reviewerComment: string | null;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+}
+
+export interface AuditWorkpaperRow {
+  id: string;
+  controlId: string;
+  controlCode: string;
+  controlTitle: string;
+  controlTestId: string | null;
+  artifactId: string | null;
+  status: 'draft' | 'needs_evidence' | 'needs_review' | 'rejected' | 'approved' | 'final';
+  reviewerNotes: string | null;
+  generatedBy: string;
+  reviewedBy: string | null;
+  approvedAt: string | null;
+  createdAt: string;
+}
+
+export interface AuditRunDetail {
+  run: AuditRunSummary;
+  controlTests: ControlTestRow[];
+  exceptions: AuditExceptionRow[];
+  workpapers: AuditWorkpaperRow[];
+}
+
+export interface FinalPackResultClient {
+  artifactId: string;
+  signature: string;
+  signatureAlgo: string;
+  manifest: { version: number; tenantId: string; workflowId: string; generatedAt: string; artifacts: Array<{ artifactId: string; fileName: string; contentHash: string; sizeBytes: number; artifactType: string }>; metadata?: Record<string, unknown> };
+  workpaperCount: number;
+  exceptionCount: number;
+  controlCount: number;
+}
+
+export const auditRunsApi = {
+  list: (params?: { status?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(
+          Object.entries(params)
+            .filter(([, v]) => v !== undefined && v !== null && String(v).length > 0)
+            .map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : '';
+    return apiDataFetch<{ items: AuditRunSummary[]; total: number; limit: number; offset: number }>(`/audit/runs${qs}`);
+  },
+  get: (id: string) =>
+    apiDataFetch<AuditRunDetail>(`/audit/runs/${id}`),
+  create: (body: { frameworkSlug: string; title: string; scope?: string; periodStart: string; periodEnd: string; metadata?: Record<string, unknown> }) =>
+    apiDataFetch<{ id: string; status: AuditRunStatusClient }>('/audit/runs', { method: 'POST', body }),
+  plan: (id: string) =>
+    apiDataFetch<{ controlsSeeded: number }>(`/audit/runs/${id}/plan`, { method: 'POST', body: {} }),
+  autoMap: (id: string) =>
+    apiDataFetch<AutoMapResultClient>(`/audit/runs/${id}/auto-map`, { method: 'POST', body: {} }),
+  testControls: (id: string, body?: { limit?: number }) =>
+    apiDataFetch<{ totalTests: number; ranTests: number; passed: number; failed: number; exceptions: number; needsEvidence: number; durationMs: number }>(`/audit/runs/${id}/test-controls`, { method: 'POST', body: body ?? {} }),
+  testSingle: (id: string, controlTestId: string) =>
+    apiDataFetch<{ result: 'pass' | 'fail' | 'exception' | 'needs_evidence' }>(`/audit/runs/${id}/controls/${controlTestId}/test`, { method: 'POST', body: {} }),
+  generateWorkpapers: (id: string, body?: { forceRegenerate?: boolean }) =>
+    apiDataFetch<{ totalControls: number; generated: number; skipped: number; failed: number; durationMs: number }>(`/audit/runs/${id}/workpapers/generate`, { method: 'POST', body: body ?? {} }),
+  decideWorkpaper: (id: string, wpId: string, body: { decision: 'approved' | 'rejected'; reviewerNotes?: string }) =>
+    apiDataFetch<AuditWorkpaperRow>(`/audit/runs/${id}/workpapers/${wpId}/decide`, { method: 'POST', body }),
+  createException: (id: string, body: { controlId: string; controlCode: string; severity: 'low' | 'medium' | 'high' | 'critical'; description: string; cause?: string; impact?: string; remediationPlan?: string; remediationOwner?: string; remediationDueDate?: string }) =>
+    apiDataFetch<{ id: string; status: string }>(`/audit/runs/${id}/exceptions`, { method: 'POST', body }),
+  updateRemediation: (id: string, exId: string, body: { remediationPlan?: string; remediationOwner?: string; remediationDueDate?: string }) =>
+    apiDataFetch<AuditExceptionRow>(`/audit/runs/${id}/exceptions/${exId}/remediation`, { method: 'PATCH', body }),
+  decideException: (id: string, exId: string, body: { to: 'accepted' | 'rejected' | 'closed' | 'remediation_planned' | 'remediation_in_progress' | 'remediation_complete'; reviewerComment?: string }) =>
+    apiDataFetch<AuditExceptionRow>(`/audit/runs/${id}/exceptions/${exId}/decide`, { method: 'POST', body }),
+  finalPack: (id: string) =>
+    apiDataFetch<FinalPackResultClient>(`/audit/runs/${id}/final-pack`, { method: 'POST', body: {} }),
+  delete: (id: string) =>
+    apiDataFetch<void>(`/audit/runs/${id}`, { method: 'DELETE' }),
+};
+
+// ─── Company Brain (Migration 16) ──────────────────────────────────────
+//
+// CompanyProfile + IntentRecord + Memory approval + WorkflowTemplate.
+// All tenant-scoped via the JWT (server reads tenantId from request.user).
+
+export type CompanyProfileStatus = 'extracted' | 'user_approved' | 'manual';
+
+export interface CompanyProfileClient {
+  id: string;
+  tenantId: string;
+  name: string | null;
+  industry: string | null;
+  description: string | null;
+  productsServices: Array<{ name: string; description?: string }> | null;
+  targetCustomers: string | null;
+  brandVoice: string | null;
+  competitors: Array<{ name: string; url?: string; notes?: string }> | null;
+  pricing: string | null;
+  websiteUrl: string | null;
+  goals: string | null;
+  constraints: string | null;
+  preferredChannels: string[] | null;
+  status: CompanyProfileStatus;
+  extractionConfidence: number | null;
+  sourceDocumentIds: string[] | null;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CompanyProfileFields {
+  name?: string;
+  industry?: string;
+  description?: string;
+  productsServices?: Array<{ name: string; description?: string }>;
+  targetCustomers?: string;
+  brandVoice?: string;
+  competitors?: Array<{ name: string; url?: string; notes?: string }>;
+  pricing?: string;
+  websiteUrl?: string;
+  goals?: string;
+  constraints?: string;
+  preferredChannels?: string[];
+}
+
+export interface IntentRecordClient {
+  id: string;
+  tenantId: string;
+  workflowId: string | null;
+  userId: string;
+  rawInput: string;
+  intent: string;
+  intentConfidence: number | null;
+  subFunction: string | null;
+  urgency: number | null;
+  workflowTemplateId: string | null;
+  clarificationNeeded: boolean;
+  clarificationQuestion: string | null;
+  directAnswer: string | null;
+  createdAt: string;
+}
+
+export interface WorkflowTemplateClient {
+  id: string;
+  tenantId: string | null;
+  intent: string;
+  name: string;
+  description: string;
+  tasksJson: unknown;
+  requiredCompanyContext: string[] | null;
+  requiredUserInputs: string[] | null;
+  approvalGates: string[] | null;
+  expectedArtifacts: string[] | null;
+  status: string;
+}
+
+export interface CompanyArtifactClient {
+  id: string;
+  tenantId: string;
+  sourceType: string;
+  artifactType: string;
+  externalId: string | null;
+  sourceUrl: string | null;
+  title: string;
+  body: string;
+  bodyHash: string;
+  authorName: string | null;
+  occurredAt: string | null;
+  metadata: Record<string, unknown> | null;
+  ingestionStatus: string;
+  extractedAt: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface CompanyGraphEntityClient {
+  id: string;
+  tenantId: string;
+  primaryArtifactId: string | null;
+  entityType: string;
+  title: string;
+  summary: string;
+  status: string;
+  ownerName: string | null;
+  priority: string | null;
+  confidence: number;
+  occurredAt: string | null;
+  dueAt: string | null;
+  sourceArtifactIds: string[] | null;
+  relatedEntityIds: string[] | null;
+  properties: Record<string, unknown> | null;
+  extractedBy: string;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface ExecutionDriftFindingClient {
+  id: string;
+  tenantId: string;
+  fingerprint: string;
+  driftType: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  status: string;
+  title: string;
+  summary: string;
+  recommendation: string;
+  evidenceArtifactIds: string[] | null;
+  evidenceEntityIds: string[] | null;
+  confidence: number;
+  detectedAt: string;
+  resolvedAt: string | null;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentExecutableSpecClient {
+  id: string;
+  tenantId: string;
+  driftFindingId: string | null;
+  title: string;
+  problemStatement: string;
+  objective: string;
+  contextSummary: string;
+  proposedApproach: string;
+  acceptanceCriteria: string[] | null;
+  testPlan: Array<{ name: string; type: string; description: string }> | null;
+  agentTaskPlan: Array<{ id: string; title: string; agentRole: string; description: string; dependsOn: string[]; riskLevel: string; requiresApproval: boolean }> | null;
+  approvalGates: Array<{ gate: string; reason: string; riskLevel: string }> | null;
+  evidenceArtifactIds: string[] | null;
+  evidenceEntityIds: string[] | null;
+  status: string;
+  generatedBy: string;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  reviewComment: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export type CompanyConnectorSyncProviderClient = 'GMAIL' | 'GITHUB' | 'GOOGLE_DRIVE';
+
+export interface CompanyConnectorSyncRunClient {
+  id: string;
+  trigger: string;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+  fetchedCount: number;
+  ingestedCount: number;
+  skippedCount: number;
+  errorMessage: string | null;
+}
+
+export interface CompanyConnectorSyncStatusClient {
+  provider: CompanyConnectorSyncProviderClient;
+  integrationProvider: string | null;
+  connected: boolean;
+  enabled: boolean;
+  status: string;
+  lastSyncedAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  lastErrorAt: string | null;
+  consecutiveFailures: number;
+  cursor: Record<string, unknown> | null;
+  latestRun: CompanyConnectorSyncRunClient | null;
+}
+
+export interface DriftCandidateClient {
+  fingerprint: string;
+  driftType: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  title: string;
+  summary: string;
+  recommendation: string;
+  evidenceArtifactIds: string[];
+  evidenceEntityIds: string[];
+  confidence: number;
+  metadata: Record<string, unknown>;
+}
+
+export const companyBrainApi = {
+  getProfile: () =>
+    apiDataFetch<{ profile: CompanyProfileClient | null }>('/company/profile'),
+  saveManualProfile: (fields: CompanyProfileFields) =>
+    apiDataFetch<{ profile: CompanyProfileClient }>('/company/profile/manual', { method: 'POST', body: fields }),
+  extractProfile: (body?: { documentIds?: string[] }) =>
+    apiDataFetch<{ profile: CompanyProfileClient }>('/company/profile/extract', { method: 'POST', body: body ?? {} }),
+  approveProfile: (body?: { edits?: CompanyProfileFields }) =>
+    apiDataFetch<{ profile: CompanyProfileClient }>('/company/profile/approve', { method: 'POST', body: body ?? {} }),
+  rejectProfile: () =>
+    apiDataFetch<void>('/company/profile', { method: 'DELETE' }),
+  listIntents: (params?: { intent?: string; userId?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString()
+      : '';
+    return apiDataFetch<{ items: IntentRecordClient[]; total: number; limit: number; offset: number }>(`/intents${qs}`);
+  },
+  intentStats: () =>
+    apiDataFetch<{ stats: Array<{ intent: string; count: number }> }>('/intents/stats'),
+  listPendingMemory: (params?: { limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString()
+      : '';
+    return apiDataFetch<{ items: Array<{ id: string; key: string; value: unknown; memoryType: string; status: string; suggestedBy: string | null; createdAt: string }>; total: number }>(`/memory/pending${qs}`);
+  },
+  approveMemory: (id: string) =>
+    apiDataFetch<{ approved: boolean; id: string }>(`/memory/${id}/approve`, { method: 'POST', body: {} }),
+  rejectMemory: (id: string, reason?: string) =>
+    apiDataFetch<{ rejected: boolean; id: string }>(`/memory/${id}/reject`, { method: 'POST', body: { reason } }),
+  listTemplates: (intent?: string) => {
+    const qs = intent ? `?intent=${encodeURIComponent(intent)}` : '';
+    return apiDataFetch<{ items: WorkflowTemplateClient[] }>(`/workflow-templates${qs}`);
+  },
+  templateForIntent: (intent: string) =>
+    apiDataFetch<{ template: WorkflowTemplateClient }>(`/workflow-templates/by-intent/${encodeURIComponent(intent)}`),
+
+  // ── Company Operating Layer (Migration 107 / closed-loop) ─────────
+  createArtifact: (body: {
+    sourceType: 'github' | 'linear' | 'jira' | 'slack' | 'notion' | 'google_drive' | 'gmail' | 'meeting' | 'customer_call' | 'support' | 'document' | 'manual' | 'other';
+    artifactType: 'ticket' | 'issue' | 'pull_request' | 'commit' | 'slack_thread' | 'notion_page' | 'document' | 'meeting_transcript' | 'customer_feedback' | 'support_ticket' | 'email' | 'decision_note' | 'other';
+    title: string;
+    body: string;
+    externalId?: string;
+    sourceUrl?: string;
+    authorName?: string;
+    occurredAt?: string;
+    metadata?: Record<string, unknown>;
+  }) => apiDataFetch<{ artifact: CompanyArtifactClient }>('/company/artifacts', { method: 'POST', body }),
+  listArtifacts: (params?: { sourceType?: string; artifactType?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString()
+      : '';
+    return apiDataFetch<{ items: CompanyArtifactClient[]; total: number; limit: number; offset: number }>(`/company/artifacts${qs}`);
+  },
+  extractArtifactEntities: (id: string) =>
+    apiDataFetch<{ artifact: CompanyArtifactClient; entities: CompanyGraphEntityClient[] }>(`/company/artifacts/${encodeURIComponent(id)}/extract`, { method: 'POST', body: {} }),
+  createEntity: (body: {
+    entityType: 'decision' | 'task' | 'spec' | 'customer_signal' | 'risk' | 'owner' | 'deadline' | 'code_change' | 'customer' | 'metric' | 'requirement';
+    title: string;
+    summary: string;
+    sourceArtifactIds: string[];
+    primaryArtifactId?: string;
+    status?: string;
+    ownerName?: string | null;
+    priority?: 'low' | 'medium' | 'high' | 'critical' | null;
+    confidence?: number;
+    occurredAt?: string;
+    dueAt?: string;
+    relatedEntityIds?: string[];
+    properties?: Record<string, unknown>;
+    extractedBy?: 'manual' | 'connector' | 'openai' | 'system';
+  }) => apiDataFetch<{ entity: CompanyGraphEntityClient }>('/company/entities', { method: 'POST', body }),
+  listEntities: (params?: { entityType?: string; status?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString()
+      : '';
+    return apiDataFetch<{ items: CompanyGraphEntityClient[]; total: number; limit: number; offset: number }>(`/company/entities${qs}`);
+  },
+  analyzeAlignment: (body?: { limit?: number }) =>
+    apiDataFetch<{ findings: ExecutionDriftFindingClient[]; candidates: DriftCandidateClient[] }>('/company/alignment/analyze', { method: 'POST', body: body ?? {} }),
+  listDriftFindings: (params?: { status?: string; severity?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString()
+      : '';
+    return apiDataFetch<{ items: ExecutionDriftFindingClient[]; total: number; limit: number; offset: number }>(`/company/alignment/drift${qs}`);
+  },
+  generateSpec: (body: { driftFindingId?: string; entityIds?: string[] }) =>
+    apiDataFetch<{ spec: AgentExecutableSpecClient }>('/company/specs/generate', { method: 'POST', body }),
+  listSpecs: (params?: { status?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString()
+      : '';
+    return apiDataFetch<{ items: AgentExecutableSpecClient[]; total: number; limit: number; offset: number }>(`/company/specs${qs}`);
+  },
+  decideSpec: (id: string, body: { decision: 'APPROVED' | 'REJECTED'; comment?: string }) =>
+    apiDataFetch<{ spec: AgentExecutableSpecClient }>(`/company/specs/${encodeURIComponent(id)}/decide`, { method: 'POST', body }),
+
+  // ── Connector sync control plane (Migration 108) ────────────────────
+  listConnectorSyncStatuses: () =>
+    apiDataFetch<{ items: CompanyConnectorSyncStatusClient[] }>('/company/sync'),
+  getConnectorSyncStatus: (provider: CompanyConnectorSyncProviderClient | 'DRIVE') =>
+    apiDataFetch<{ status: CompanyConnectorSyncStatusClient }>(`/company/sync?provider=${encodeURIComponent(provider)}`),
+  enableConnectorSync: (provider: CompanyConnectorSyncProviderClient | 'DRIVE') =>
+    apiDataFetch<{ status: CompanyConnectorSyncStatusClient }>(`/company/sync/${encodeURIComponent(provider)}/enable`, { method: 'POST', body: {} }),
+  disableConnectorSync: (provider: CompanyConnectorSyncProviderClient | 'DRIVE') =>
+    apiDataFetch<{ status: CompanyConnectorSyncStatusClient }>(`/company/sync/${encodeURIComponent(provider)}/disable`, { method: 'POST', body: {} }),
+  triggerConnectorSync: (provider: CompanyConnectorSyncProviderClient | 'DRIVE', body?: { mode?: 'incremental' | 'full' }) =>
+    apiDataFetch<{ run: { runId: string; status: string; fetchedCount: number; ingestedCount: number; skippedCount: number }; status: CompanyConnectorSyncStatusClient }>(
+      `/company/sync/${encodeURIComponent(provider)}/trigger`,
+      { method: 'POST', body: { mode: body?.mode ?? 'incremental' } },
+    ),
+
+  // ── Knowledge sources (Sprint 2.3 / Item C) ──────────────────────────
+  // URLs registered for the company brain crawler. The crawler service
+  // is server-side; clients just trigger + poll.
+  listKnowledgeSources: (params?: { kind?: string; status?: string; limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString()
+      : '';
+    return apiDataFetch<{ sources: Array<KnowledgeSourceClient> }>(`/company/knowledge-sources${qs}`);
+  },
+  createKnowledgeSource: (body: { url: string; kind: 'website' | 'competitor' | 'pricing' | 'product' | 'blog' | 'other'; title?: string }) =>
+    apiDataFetch<{ source: KnowledgeSourceClient }>('/company/knowledge-sources', { method: 'POST', body }),
+  crawlKnowledgeSource: (id: string) =>
+    apiDataFetch<{ result: KnowledgeSourceCrawlResult }>(`/company/knowledge-sources/${id}/crawl`, { method: 'POST', body: {} }),
+  deleteKnowledgeSource: (id: string) =>
+    apiDataFetch<{ deleted: boolean }>(`/company/knowledge-sources/${id}`, { method: 'DELETE' }),
+};
+
+export interface KnowledgeSourceClient {
+  id: string;
+  tenantId: string;
+  url: string;
+  kind: string;
+  title: string | null;
+  lastCrawledAt: string | null;
+  lastCrawlStatus: string;
+  lastCrawlError: string | null;
+  vectorDocumentIds: unknown;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface KnowledgeSourceCrawlResult {
+  status: 'crawled' | 'failed' | 'blocked_by_robots' | 'rate_limited' | 'invalid_url';
+  textLength: number;
+  chunksCreated?: number;
+  title?: string;
+  error?: string;
+  flags: string[];
+}
+
+// ─── SYSTEM_ADMIN cross-tenant aggregate views ─────────────────────────
+//
+// Separate surface from /audit/* (tenant-scoped). Only SYSTEM_ADMIN
+// users can call these — the API enforces it.
+
+export interface AdminOverview {
+  generatedAt: string;
+  tenants: { total: number; byStatus: Array<{ status: string; count: number }> };
+  users: { total: number };
+  workflows: {
+    total: number;
+    byStatus: Array<{ status: string; count: number }>;
+    last24h: number;
+    last7d: number;
+    last30d: number;
+    totalCostUsd: number;
+  };
+  auditLog: { total: number; last24h: number };
+  compliance: { attestationsTotal: number; activeSchedules: number };
+}
+
+export interface AdminTenantRow {
+  id: string;
+  name: string;
+  slug: string;
+  industry: string | null;
+  status: string;
+  createdAt: string;
+  workflowCount: number;
+  approvalCount: number;
+  attestationCount: number;
+  evidenceMappingCount: number;
+}
+
+export interface AdminFrameworkRollup {
+  slug: string;
+  name: string;
+  version: string;
+  totalControls: number;
+  tenantsWithEvidence: number;
+  totalEvidenceMappings: number;
+  attestationsGenerated: number;
+}
+
+export const adminAggregateApi = {
+  overview: () => apiDataFetch<AdminOverview>('/admin/aggregate/overview'),
+  tenants: (params?: { limit?: number; offset?: number }) => {
+    const qs = params
+      ? '?' + new URLSearchParams(
+          Object.entries(params)
+            .filter(([, v]) => v !== undefined && v !== null && String(v).length > 0)
+            .map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : '';
+    return apiDataFetch<{ items: AdminTenantRow[]; total: number; limit: number; offset: number }>(`/admin/aggregate/tenants${qs}`);
+  },
+  compliance: () => apiDataFetch<{ frameworks: AdminFrameworkRollup[] }>('/admin/aggregate/compliance'),
+};
+
+export interface ScheduledAttestationItem {
+  id: string;
+  tenantId: string;
+  frameworkId: string;
+  frameworkSlug?: string;
+  frameworkName?: string;
+  cronExpression: string;
+  windowDays: number;
+  signBundles: boolean;
+  active: boolean;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastRunStatus: string | null;
+  lastAttestationId: string | null;
+  createdBy: string;
+  createdAt: string;
+}
+
+export const apiKeyApi = {
+  /** GET /tenants/current/api-keys */
+  list: () => apiDataFetch<unknown[]>('/tenants/current/api-keys'),
+
+  /**
+   * POST /tenants/current/api-keys
+   * Returns { ...key, key: '<rawKey>' } — the raw key is returned only once.
+   */
+  create: (body: { name: string; scopes?: string[]; expiresAt?: string }) =>
+    apiDataFetch<{ id: string; name: string; scopes: string[]; expiresAt: string | null; createdAt: string; key: string }>(
+      '/tenants/current/api-keys',
+      { method: 'POST', body },
+    ),
+
+  /** DELETE /tenants/current/api-keys/:keyId */
+  revoke: (keyId: string) =>
+    apiDataFetch<void>(`/tenants/current/api-keys/${keyId}`, { method: 'DELETE' }),
+};
+
+export const toolToggleApi = {
+  /**
+   * PATCH /tenants/current/tools/:toolName
+   * Enable or disable a specific tool for this tenant.
+   */
+  toggle: (toolName: string, enabled: boolean) =>
+    apiDataFetch<{ toolName: string; enabled: boolean; disabledToolNames: string[] }>(
+      `/tenants/current/tools/${encodeURIComponent(toolName)}`,
+      { method: 'PATCH', body: { enabled } },
+    ),
+};
+
+// ─── Schedule API ────────────────────────────────────────────────────────────
+
+export const scheduleApi = {
+  list: () => apiClient.get<unknown>('/schedules'),
+  get: (id: string) => apiClient.get<unknown>(`/schedules/${id}`),
+  create: (body: { name: string; goal: string; cronExpression: string; description?: string; industry?: string; maxCostUsd?: number; roleModes?: string[] }) =>
+    apiClient.post<unknown>('/schedules', body),
+  update: (id: string, body: Record<string, unknown>) =>
+    apiClient.patch<unknown>(`/schedules/${id}`, body),
+  delete: (id: string) => apiClient.delete<unknown>(`/schedules/${id}`),
+  runNow: (id: string) => apiClient.post<unknown>(`/schedules/${id}/run`),
+};
+
+// ─── Standing Orders API ─────────────────────────────────────────────────────
+//
+// Mirrors the backend at apps/api/src/routes/standing-orders.routes.ts.
+// Backend Zod schema is the single source of truth for the request body
+// shape; this client just wraps the HTTP verbs. Empty arrays mean "no
+// boundary on that dimension" (default-allow + tenant policy applies);
+// non-empty arrays are strict.
+
+export interface CreateStandingOrderBody {
+  name: string;
+  description?: string;
+  workflowScheduleId?: string | null;
+  allowedTools?: string[];
+  blockedActions?: string[];
+  approvalRequiredFor?: string[];
+  allowedSources?: string[];
+  budgetUsd?: number | null;
+  expiresAt?: string | null;
+  enabled?: boolean;
+}
+
+export const standingOrdersApi = {
+  list: () => apiClient.get<unknown>('/standing-orders'),
+  get: (id: string) => apiClient.get<unknown>(`/standing-orders/${id}`),
+  create: (body: CreateStandingOrderBody) =>
+    apiClient.post<unknown>('/standing-orders', body),
+  update: (id: string, body: Partial<CreateStandingOrderBody>) =>
+    apiClient.patch<unknown>(`/standing-orders/${id}`, body),
+  delete: (id: string) => apiClient.delete<unknown>(`/standing-orders/${id}`),
+  /** Convenience shortcut to disable without a full PATCH body. */
+  disable: (id: string) => apiClient.post<unknown>(`/standing-orders/${id}/disable`),
+};
+
+// ─── Migration 106 — Team + Trial APIs ───────────────────────────────
+//
+// Backend routes:
+//   /task-assignments  — task-assignments.routes.ts
+//   /inbox             — inbox.routes.ts
+//   /team              — team.routes.ts
+//   /trial             — trial.routes.ts
+
+export interface CreateTaskAssignmentBody {
+  workflowId: string;
+  taskId: string;
+  assigneeUserId: string;
+  title: string;
+  instructions?: string;
+  riskLevel?: string;
+  dueAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export const taskAssignmentApi = {
+  list: (params?: { status?: string; workflowId?: string; assigneeUserId?: string; limit?: number }) => {
+    const qs = params
+      ? `?${new URLSearchParams(
+          Object.fromEntries(
+            Object.entries(params).filter(([, v]) => v !== undefined),
+          ) as Record<string, string>,
+        ).toString()}`
+      : '';
+    return apiClient.get<unknown>(`/task-assignments${qs}`);
+  },
+  mine: (status?: string) =>
+    apiClient.get<unknown>(`/task-assignments/me${status ? `?status=${status}` : ''}`),
+  get: (id: string) => apiClient.get<unknown>(`/task-assignments/${id}`),
+  create: (body: CreateTaskAssignmentBody) =>
+    apiClient.post<unknown>('/task-assignments', body),
+  acknowledge: (id: string) => apiClient.post<unknown>(`/task-assignments/${id}/acknowledge`),
+  complete: (id: string, body?: { result?: Record<string, unknown>; note?: string }) =>
+    apiClient.post<unknown>(`/task-assignments/${id}/complete`, body ?? {}),
+  decline: (id: string, reason: string) =>
+    apiClient.post<unknown>(`/task-assignments/${id}/decline`, { reason }),
+  cancel: (id: string) => apiClient.post<unknown>(`/task-assignments/${id}/cancel`),
+};
+
+export const inboxApi = {
+  get: () => apiClient.get<unknown>('/inbox'),
+  markRead: (notificationId: string) =>
+    apiClient.post<unknown>(`/inbox/notifications/${notificationId}/read`),
+  markAllRead: () => apiClient.post<unknown>('/inbox/notifications/read-all'),
+};
+
+export interface CreateDepartmentBody {
+  name: string;
+  description?: string;
+  parentId?: string | null;
+}
+
+export interface UpdateMembershipBody {
+  departmentId?: string | null;
+  jobTitle?: string | null;
+  managerId?: string | null;
+}
+
+export const teamApi = {
+  listDepartments: () => apiClient.get<unknown>('/team/departments'),
+  getDepartment: (id: string) => apiClient.get<unknown>(`/team/departments/${id}`),
+  createDepartment: (body: CreateDepartmentBody) =>
+    apiClient.post<unknown>('/team/departments', body),
+  updateDepartment: (id: string, body: Partial<CreateDepartmentBody>) =>
+    apiClient.patch<unknown>(`/team/departments/${id}`, body),
+  deleteDepartment: (id: string) => apiClient.delete<unknown>(`/team/departments/${id}`),
+  listMembers: (q?: string, departmentId?: string) => {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (departmentId) params.set('departmentId', departmentId);
+    const qs = params.toString();
+    return apiClient.get<unknown>(`/team/members${qs ? `?${qs}` : ''}`);
+  },
+  updateMember: (userId: string, body: UpdateMembershipBody) =>
+    apiClient.patch<unknown>(`/team/members/${userId}`, body),
+};
+
+export interface TrialSignupBody {
+  email: string;
+  companyName?: string;
+  industry?: string;
+  teamSize?: '1' | '2-5' | '6-20' | '21-100' | '100+';
+  source?: string;
+}
+
+export const trialApi = {
+  signup: (body: TrialSignupBody) => apiClient.post<unknown>('/trial/signup', body),
+  verify: (token: string) => apiClient.post<unknown>(`/trial/verify/${token}`),
+  status: () => apiClient.get<unknown>('/trial/status'),
+};
+
+// ─── Projects (Vibe Coding) ─────────────────────────────────────────
+
+export const projectApi = {
+  list: (params?: { page?: number; status?: string }) =>
+    apiClient.get<unknown>(`/projects${params ? `?${new URLSearchParams(params as Record<string, string>).toString()}` : ''}`),
+  get: (id: string) => apiClient.get<unknown>(`/projects/${id}`),
+  create: (body: { name: string; description?: string; framework?: string; templateId?: string }) =>
+    apiClient.post<unknown>('/projects', body),
+  generate: (id: string, body: { description: string; framework?: string; templateId?: string; imageBase64?: string }) =>
+    apiClient.post<unknown>(`/projects/${id}/generate`, body),
+  iterate: (id: string, body: { message: string; imageBase64?: string }) =>
+    apiClient.post<unknown>(`/projects/${id}/iterate`, body),
+  deploy: (id: string) =>
+    apiClient.post<unknown>(`/projects/${id}/deploy`),
+  rollback: (id: string, version: number) =>
+    apiClient.post<unknown>(`/projects/${id}/rollback`, { version }),
+  files: (id: string) => apiClient.get<unknown>(`/projects/${id}/files`),
+  updateFile: (id: string, path: string, content: string) =>
+    apiClient.put<unknown>(`/projects/${id}/files/${path}`, { content }),
+  versions: (id: string) => apiClient.get<unknown>(`/projects/${id}/versions`),
+  conversations: (id: string) => apiClient.get<unknown>(`/projects/${id}/conversations`),
+  delete: (id: string) => apiClient.delete<unknown>(`/projects/${id}`),
+
+  // ─── Checkpoints (diff-aware revert, replaces rollback/versions for new UI) ───
+  // Each of these unwraps the `{success, data}` envelope via apiDataFetch so
+  // consumers get a typed value directly (no `res.data` gymnastics).
+  listCheckpoints: (id: string, limit?: number) =>
+    apiDataFetch<Checkpoint[]>(`/projects/${id}/checkpoints${limit ? `?limit=${limit}` : ''}`),
+  getCheckpoint: (id: string, version: number) =>
+    apiDataFetch<CheckpointDetail>(`/projects/${id}/checkpoints/${version}`),
+  createCheckpoint: (id: string, body?: { description?: string; stage?: string; workflowId?: string }) =>
+    apiDataFetch<Checkpoint>(`/projects/${id}/checkpoints`, { method: 'POST', body: body ?? {} }),
+  restoreCheckpoint: (id: string, version: number) =>
+    apiDataFetch<Checkpoint>(`/projects/${id}/checkpoints/${version}/restore`, { method: 'POST', body: {} }),
+};
+
+// ─── Checkpoint types (mirror CheckpointService output shape) ───────────
+export type CheckpointStage = 'architect' | 'generator' | 'debugger' | 'deployer' | 'manual' | 'rollback';
+
+export interface CheckpointDiffEntry {
+  path: string;
+  prevSize?: number;
+  nextSize?: number;
+  prevHash?: string;
+  nextHash?: string;
+}
+
+export interface CheckpointDiff {
+  added: CheckpointDiffEntry[];
+  modified: CheckpointDiffEntry[];
+  deleted: CheckpointDiffEntry[];
+  totalFiles: number;
+  hasChanges: boolean;
+}
+
+export interface Checkpoint {
+  id: string;
+  version: number;
+  description: string | null;
+  stage: CheckpointStage | null;
+  workflowId: string | null;
+  createdBy: string;
+  createdAt: string;
+  diff: CheckpointDiff | null;
+}
+
+export interface CheckpointDetail extends Checkpoint {
+  snapshot: Array<{ path: string; content: string; language: string | null }>;
+}
+
+// ─── Usage & Billing ──────────────────────────────────────────────────
+
+export const usageApi = {
+  /** Current credit balance and limits */
+  getUsage: () => apiDataFetch<{
+    plan: string;
+    credits: { used: number; total: number; remaining: number };
+    premium: { used: number; total: number; remaining: number };
+    daily: { used: number; cap: number; remaining: number; resetsAt: string };
+    monthly: { resetsAt: string };
+    perTaskCap: number;
+    maxModelTier: number;
+  }>('/usage'),
+
+  /** Recent usage history */
+  getHistory: (params?: { limit?: number; offset?: number }) => {
+    const qs = params ? `?${new URLSearchParams(Object.fromEntries(Object.entries(params).map(([k, v]) => [k, String(v)]))).toString()}` : '';
+    return apiDataFetch<{ entries: Array<{ id: string; taskType: string; modelUsed: string; creditsCost: number; status: string; createdAt: string }>; total: number }>(`/usage/history${qs}`);
+  },
+
+  /** Pre-execution cost estimate */
+  estimate: (goal: string) => apiDataFetch<{
+    taskType: string;
+    estimatedCredits: number;
+    model: string;
+    tier: number;
+    canAfford: boolean;
+    remaining: { daily: number; monthly: number };
+    message: string;
+  }>('/usage/estimate', { method: 'POST', body: { goal } }),
+};
+
+// ─── External Auditor Portal (Sprint 2.6) ───────────────────────────────
+
+export interface AuditorEngagement {
+  id: string;
+  tenantId: string;
+  userId: string;
+  auditorEmail: string;
+  auditRunId: string;
+  inviteId: string;
+  scopes: string[];
+  accessGrantedAt: string;
+  accessRevokedAt: string | null;
+  expiresAt: string;
+}
+
+export interface AuditorInvite {
+  id: string;
+  auditorEmail: string;
+  auditorName: string | null;
+  status: string;
+  scopes: string[];
+  expiresAt: string;
+  acceptedAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+export interface AuditorAction {
+  id: string;
+  userId: string;
+  auditorEmail: string;
+  auditRunId: string;
+  engagementId: string;
+  objectType: string;
+  objectId: string | null;
+  action: string;
+  comment: string | null;
+  createdAt: string;
+}
+
+export const externalAuditorApi = {
+  // Admin (REVIEWER+) endpoints
+  createInvite: (auditRunId: string, body: { auditorEmail: string; auditorName?: string; scopes?: string[]; expiresInDays?: number }) =>
+    apiDataFetch<{
+      inviteId: string;
+      cleartextToken: string;
+      acceptUrl: string;
+      expiresAt: string;
+      // Final hardening / Gap C — honest email status. UI shows
+      // "copy link" if status !== 'sent'.
+      emailStatus: 'sent' | 'not_configured' | 'failed';
+      emailError?: string;
+    }>(
+      `/audit/runs/${encodeURIComponent(auditRunId)}/auditors/invite`,
+      { method: 'POST', body },
+    ),
+  listInvites: (auditRunId: string) =>
+    apiDataFetch<{ invites: AuditorInvite[] }>(`/audit/runs/${encodeURIComponent(auditRunId)}/auditors`),
+  revokeInvite: (auditRunId: string, inviteId: string) =>
+    apiDataFetch<{ revoked: boolean }>(
+      `/audit/runs/${encodeURIComponent(auditRunId)}/auditors/${encodeURIComponent(inviteId)}/revoke`,
+      { method: 'POST', body: {} },
+    ),
+  listActions: (auditRunId: string) =>
+    apiDataFetch<{ actions: AuditorAction[] }>(`/audit/runs/${encodeURIComponent(auditRunId)}/auditors/actions`),
+
+  // Auditor (EXTERNAL_AUDITOR role) endpoints
+  acceptInvite: (token: string) =>
+    apiDataFetch<{ token: string; engagement: { id: string; auditRunId: string; tenantId: string; scopes: string[]; expiresAt: string } }>(
+      `/auditor/accept/${encodeURIComponent(token)}`,
+      { method: 'POST', body: {} },
+    ),
+  myEngagements: () =>
+    apiDataFetch<{ engagements: AuditorEngagement[] }>('/auditor/runs'),
+  getRun: (auditRunId: string) =>
+    apiDataFetch<{ auditRun: Record<string, unknown> }>(`/auditor/runs/${encodeURIComponent(auditRunId)}`),
+  listWorkpapers: (auditRunId: string) =>
+    apiDataFetch<{ workpapers: Array<Record<string, unknown>> }>(
+      `/auditor/runs/${encodeURIComponent(auditRunId)}/workpapers`,
+    ),
+  decideWorkpaper: (auditRunId: string, wpId: string, body: { decision: 'APPROVE' | 'REJECT' | 'REQUEST_CHANGES'; comment?: string }) =>
+    apiDataFetch<{ workpaper: Record<string, unknown> }>(
+      `/auditor/runs/${encodeURIComponent(auditRunId)}/workpapers/${encodeURIComponent(wpId)}/decide`,
+      { method: 'POST', body },
+    ),
+  postComment: (auditRunId: string, comment: string) =>
+    apiDataFetch<{ logged: boolean }>(
+      `/auditor/runs/${encodeURIComponent(auditRunId)}/comment`,
+      { method: 'POST', body: { comment } },
+    ),
+
+  // Final-pack metadata + download (Final hardening / Gap D)
+  finalPackMetadata: (auditRunId: string) =>
+    apiDataFetch<{
+      artifactId: string;
+      mimeType: string;
+      sizeBytes: number | null;
+      approvalState: string;
+      gate: 'available' | 'pending_approval' | 'rejected' | 'unknown';
+      fileName: string | null;
+      createdAt: string;
+      framework: string | null;
+    }>(`/auditor/runs/${encodeURIComponent(auditRunId)}/final-pack/metadata`),
+  downloadFinalPack: (auditRunId: string) =>
+    apiDataFetch<
+      | { kind: 'storage'; url: string; expiresAt: string }
+      | { kind: 'inline'; content: string; mimeType: string }
+    >(
+      `/auditor/runs/${encodeURIComponent(auditRunId)}/final-pack/download`,
+      { method: 'POST', body: {} },
+    ),
+};
+
+// ─── Connector Runtime ─────────────────────────────────────────────────────
+// Read-only client for the /connectors REST surface added in the connector-
+// first launch (2026-04-29). The dashboard /connectors page consumes
+// list() + the resolver via this client.
+
+/**
+ * Lightweight type matching the API response shape — the canonical
+ * type lives in @jak-swarm/tools (ConnectorView). Frontend re-types it
+ * here so it doesn't need a server-package import.
+ */
+export type ConnectorStatusValue =
+  | 'available' | 'installed' | 'configured' | 'needs_user_setup'
+  | 'failed_validation' | 'unavailable' | 'disabled' | 'blocked_by_policy';
+
+export interface ConnectorViewClient {
+  manifest: {
+    id: string;
+    name: string;
+    category: 'creative' | 'coding' | 'research' | 'business' | 'media' | 'local' | 'cloud';
+    description: string;
+    runtimeType: string;
+    installMethod?: string;
+    installCommand?: string;
+    sourceAllowlist?: string[];
+    manualSetupSteps?: string[];
+    validationCommand?: string;
+    availableTools: string[];
+    riskLevel: string;
+    approvalRequired: boolean;
+    supportsAutoApproval: boolean;
+    supportsSandbox: boolean;
+    supportsCloud: boolean;
+    supportsLocal: boolean;
+    canModifyFiles: boolean;
+    canPublishExternalContent: boolean;
+    canAccessUserData: boolean;
+    defaultEnabled: boolean;
+    docsUrl?: string;
+    setupInstructions?: string;
+    source: 'mcp-providers' | 'manual';
+    packageStatus?: 'OFFICIAL' | 'ANTHROPIC' | 'COMMUNITY';
+  };
+  status: ConnectorStatusValue;
+  lastValidatedAt?: string;
+  installedToolCount?: number;
+  statusReason?: string;
+}
+
+export interface ConnectorListResponse {
+  connectors: ConnectorViewClient[];
+  total: number;
+  registered: number;
+  counts: Record<ConnectorStatusValue, number>;
+}
+
+export interface ConnectorCandidateClient {
+  connectorId: string;
+  confidence: number;
+  reason: string;
+  isReady: boolean;
+  nextStep?: string;
+}
+
+export interface ConnectorResolveResponseClient {
+  primary?: ConnectorCandidateClient;
+  alternatives: ConnectorCandidateClient[];
+  unavailable: ConnectorCandidateClient[];
+}
+
+export const connectorApi = {
+  /**
+   * GET /connectors?category=&status=
+   *
+   * P2 audit fix: previously this built the query string by hand which
+   * was inconsistent with the rest of api-client.ts and would emit a
+   * trailing `?` for empty params. Now uses `URLSearchParams` (same
+   * pattern as `workflowApi.list`) so encoding edge cases (spaces,
+   * `&`, `=`) are handled by the platform.
+   */
+  list: (params?: { category?: string; status?: string }) => {
+    const filtered: Record<string, string> = {};
+    if (params?.category) filtered['category'] = params.category;
+    if (params?.status) filtered['status'] = params.status;
+    const search = new URLSearchParams(filtered).toString();
+    const qs = search ? `?${search}` : '';
+    return apiDataFetch<ConnectorListResponse>(`/connectors${qs}`);
+  },
+
+  /** GET /connectors/:id */
+  get: (id: string) => apiDataFetch<ConnectorViewClient>(`/connectors/${encodeURIComponent(id)}`),
+
+  /** POST /connectors/resolve */
+  resolve: (task: string, opts?: { hintedRoles?: string[]; maxAlternatives?: number }) =>
+    apiDataFetch<ConnectorResolveResponseClient>('/connectors/resolve', {
+      method: 'POST',
+      body: { task, ...(opts ?? {}) },
+    }),
+};
