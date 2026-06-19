@@ -75,9 +75,11 @@ export async function proxy(request: NextRequest) {
 
   if (demoMode) {
     // The demo module (/h0) uses no authentication — the dashboard is open and
-    // self-contained. Redirect the root and every auth/sign-in/trial route to
-    // /h0 so no login or sign-up UI is ever reachable in the demo. Everything
-    // else (the /h0 dashboard, /api/h0/*) passes straight through.
+    // self-contained. The root (`/`) renders the JackOps landing page (the
+    // product pitch, with a "Launch H0 Demo" banner → /h0) so judges see the
+    // product before entering the demo. Every auth/sign-in/trial route is still
+    // redirected to /h0 so no login or sign-up UI is ever reachable in the demo.
+    // /h0 itself and /api/h0/* pass straight through.
     const pathname = request.nextUrl.pathname;
     const AUTH_ROUTE_ROOTS = [
       '/login',
@@ -88,7 +90,6 @@ export async function proxy(request: NextRequest) {
       '/onboarding',
     ];
     const isAuthRoute =
-      pathname === '/' ||
       pathname.startsWith('/auth/') ||
       AUTH_ROUTE_ROOTS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
     if (isAuthRoute) {
