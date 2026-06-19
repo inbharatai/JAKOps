@@ -6,6 +6,7 @@ import { AppLayout } from './AppLayout';
 import { useAuthSession } from '@/lib/auth-session';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { useConversationStore } from '@/store/conversation-store';
+import { isH0DemoMode } from '@/lib/h0-demo';
 
 const AUTH_PATHS = ['/login', '/register', '/', '/forgot-password', '/reset-password', '/onboarding', '/privacy', '/terms', '/trial'];
 
@@ -48,9 +49,41 @@ export function AppShell({ children }: AppShellProps) {
   // component) instead of a raw `<script>` in layout.tsx — Next.js 16
   // emits a console error for any `<script>` element in render output,
   // and `useEffect` is the supported pattern.
+  //
+  // H0 demo: a persistent service worker is pure downside for a no-login
+  // judge demo — it caches across deployments and can serve a stale/broken
+  // page ("This page couldn't load") from a prior failed build even after a
+  // new Ready deployment ships. So in demo mode (or on any /h0 route) we do
+  // NOT register the SW, and we proactively unregister any existing SW +
+  // clear its caches so a browser that previously cached a broken build
+  // self-heals on the next load. Non-demo routes keep the original behavior.
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (!('serviceWorker' in navigator)) return;
+
+    const demoRoute = pathname === '/h0' || pathname?.startsWith('/h0/');
+    if (isH0DemoMode() || demoRoute) {
+      navigator.serviceWorker
+        .getRegistrations()
+        .then((regs) => Promise.all(regs.map((reg) => reg.unregister())))
+        .catch(() => {
+          /* non-fatal */
+        });
+      if (window.caches) {
+        caches
+          .keys()
+          .then((keys) =>
+            Promise.all(
+              keys.filter((k) => k.startsWith('jak-swarm')).map((k) => caches.delete(k)),
+            ),
+          )
+          .catch(() => {
+            /* non-fatal */
+          });
+      }
+      return;
+    }
+
     const register = () => {
       navigator.serviceWorker.register('/sw.js').catch((err: unknown) => {
         // eslint-disable-next-line no-console
@@ -64,7 +97,7 @@ export function AppShell({ children }: AppShellProps) {
       return () => window.removeEventListener('load', register);
     }
     return undefined;
-  }, []);
+  }, [pathname]);
 
   const isAuthPage = AUTH_PATHS.some(
     p => pathname === p,
