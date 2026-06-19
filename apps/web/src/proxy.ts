@@ -56,6 +56,18 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next({ request });
   }
 
+  // H0 demo mode: preconfigured demo workspace for instant judge access.
+  // The H0 demo is backed by Amazon Aurora PostgreSQL (not Supabase) and is
+  // meant to open with no login/signup, so skip the Supabase session refresh
+  // and dashboard route protection entirely. NOTE: H0 demo mode skips
+  // authentication for judge/demo access only. Do not enable in production.
+  if (
+    process.env['H0_DEMO_MODE'] === 'true' ||
+    process.env['NEXT_PUBLIC_H0_DEMO_MODE'] === 'true'
+  ) {
+    return NextResponse.next({ request });
+  }
+
   let supabaseResponse = NextResponse.next({ request });
   const supabaseUrl = normalizeSupabaseProjectUrl(process.env['NEXT_PUBLIC_SUPABASE_URL']);
 
