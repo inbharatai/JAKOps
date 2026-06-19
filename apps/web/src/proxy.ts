@@ -56,14 +56,22 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next({ request });
   }
 
-  // H0 demo mode: preconfigured demo workspace for instant judge access.
-  // The H0 demo is backed by Amazon Aurora PostgreSQL (not Supabase) and is
-  // meant to open with no login/signup, so skip the Supabase session refresh
-  // and dashboard route protection entirely. NOTE: H0 demo mode skips
-  // authentication for judge/demo access only. Do not enable in production.
+  // H0 demo mode OR Supabase not configured: preconfigured demo workspace for
+  // instant judge access. The H0 demo is backed by Amazon Aurora PostgreSQL
+  // (not Supabase); when the Supabase URL/key are absent there is nothing to
+  // authenticate against, so pass through instead of letting createServerClient
+  // throw (which 500s every route). NOTE: H0 demo mode skips authentication for
+  // judge/demo access only. Do not enable in production. The non-NEXT_PUBLIC
+  // H0_DEMO_MODE flag is not visible in the Edge runtime where the proxy runs,
+  // so we also gate on the public flag and on Supabase config presence.
+  const supabaseConfigured = Boolean(
+    normalizeSupabaseProjectUrl(process.env['NEXT_PUBLIC_SUPABASE_URL']) &&
+      process.env['NEXT_PUBLIC_SUPABASE_ANON_KEY'],
+  );
   if (
     process.env['H0_DEMO_MODE'] === 'true' ||
-    process.env['NEXT_PUBLIC_H0_DEMO_MODE'] === 'true'
+    process.env['NEXT_PUBLIC_H0_DEMO_MODE'] === 'true' ||
+    !supabaseConfigured
   ) {
     return NextResponse.next({ request });
   }
