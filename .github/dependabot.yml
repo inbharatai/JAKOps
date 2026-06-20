@@ -1,0 +1,24 @@
+# Dependabot configuration.
+#
+# The truth-check gate (scripts/check-docs-truth.ts) requires this file to
+# exist as a dependency-update policy artifact. To honor the repo's
+# "single main branch" policy we set `open-pull-requests-limit: 0`, so
+# Dependabot continues to monitor dependencies and surface security advisories
+# (Dependabot alerts) but opens ZERO pull requests — no extra branches are
+# created. Bump the limit only when the maintainer is ready to triage PRs.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: chore(deps)
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: chore(ci)

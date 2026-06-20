@@ -12,6 +12,12 @@
 [![Demo](https://img.shields.io/badge/Demo-No_Signup_·_Instant_Access-22c55e?style=for-the-badge)](#-preconfigured-demo-workspace--no-auth)
 [![Repo](https://img.shields.io/badge/Repo-inbharatai/JAKOps-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/inbharatai/JAKOps)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
+[![AI Agents](https://img.shields.io/badge/AI_Agents-38-specialist-6366f1?style=for-the-badge)](#-tech-stack)
+[![Tools](https://img.shields.io/badge/Classified_Tools-122-0ea5e9?style=for-the-badge)](#-serverless-tool-whitelist)
+[![Connectors](https://img.shields.io/badge/Connectors-23-integrations-8b5cf6?style=for-the-badge)](#-tech-stack)
+[![JAK Shield](https://img.shields.io/badge/JAK_Shield-Defensive_Only-ef4444?style=for-the-badge)](#-jak-shield--the-human-in-the-loop-gate)
+[![Release](https://img.shields.io/badge/Release-Beta_0.1.0--beta.0-f59e0b?style=for-the-badge)](#-scope--honesty)
+[![Tests](https://img.shields.io/badge/Tests-2154_blocking_CI-10b981?style=for-the-badge)](#-local-development)
 
 </div>
 
@@ -24,6 +30,8 @@ JackOps is an **AI operations command center** that turns a plain-English busine
 It is deployed live on **Vercel** (Next.js) with **Amazon Aurora PostgreSQL** as the system of record. There is no login: a judge clicks **Try Demo** and lands directly in the real chat cockpit, which drives the real agent engine against the live database.
 
 > This is the H0 hackathon build. It is a real, working product, not a click-through mock: the planner, workers, guardrail, and verifier are the genuine SwarmRunner graph; traces, approvals, and audit are persisted to Aurora; LLM spend is real. The one honest caveat is documented in [Scope & honesty](#-scope--honesty): server-only side effects (actually transmitting an email) cannot run inside a Vercel serverless function, so the *authorized decision* is recorded rather than the *transmission*. The gating, the review, and the audit are real.
+
+> **Status — this is a working challenge build, not a hosted production release.** Release `Beta 0.1.0-beta.0`: the real LangGraph engine runs end-to-end on Vercel + Aurora against the live LLM, exercising 38 specialist agents and 122 classified tools, gated by the defensive-only JAK Shield, with 2154 blocking CI tests. It is a controlled beta with a post-challenge production hardening roadmap — see the [FAQ](#-faq) for what is *not* yet done. Real LLM API keys are required to run the engine (OpenAI preferred, or Gemini); without a key the stream route fails honestly rather than faking output.
 
 ### Why it exists
 
@@ -334,6 +342,22 @@ docs/
 - **AWS DB screenshot:** see `docs/H0_DEVPOST_SUBMISSION.md`
 - **Demo script:** `docs/H0_DEMO_SCRIPT.md`
 - **Submission text:** `docs/H0_DEVPOST_SUBMISSION.md`
+
+---
+
+## FAQ
+
+### Is JAK Swarm production-ready?
+
+**No — not yet.** JAK Swarm (the engine JackOps runs, exported from `packages/swarm` as `@jak-swarm/swarm`) is a working challenge build that runs the real LangGraph graph end-to-end on Vercel + Aurora, but it is **not** production-ready for hosted multi-tenant use. It has not undergone a third-party security audit, carries no SOC 2 or ISO 27001 attestation, and ships no lawyer-reviewed Terms of Service, Privacy Policy, or DPA. Demo mode disables authentication entirely, so it must not be exposed as a public hosted product. Closing these gaps is the first item on the post-challenge production hardening roadmap.
+
+### Do I need API keys?
+
+Yes — real LLM API keys are required. The engine calls OpenAI (preferred) or Gemini live; if neither `OPENAI_API_KEY` nor `GEMINI_API_KEY` is set, the stream route returns `failed` with a clear message instead of producing fake output.
+
+### What does "defensive-only" JAK Shield mean?
+
+The guardrail classifies risk and holds high-risk external actions for human approval, and it refuses offensive cyber operations (malware, phishing, exploitation). It is a defensive control plane — it does not support offensive use.
 
 ---
 
