@@ -74,12 +74,13 @@ export async function proxy(request: NextRequest) {
     !supabaseConfigured;
 
   if (demoMode) {
-    // The demo module (/h0) uses no authentication — the dashboard is open and
-    // self-contained. The root (`/`) renders the JackOps landing page (the
-    // product pitch, with a "Launch H0 Demo" banner → /h0) so judges see the
-    // product before entering the demo. Every auth/sign-in/trial route is still
-    // redirected to /h0 so no login or sign-up UI is ever reachable in the demo.
-    // /h0 itself and /api/h0/* pass straight through.
+    // Contest / demo mode — preconfigured demo workspace for instant judge
+    // access. The root (`/`) renders the JackOps landing page (product pitch);
+    // the top-right "Sign In" CTA takes a judge straight into the real
+    // operations cockpit at /workspace (no login form). Every auth/sign-up/
+    // trial route is redirected to /workspace so no login UI is ever
+    // reachable. /api/* and /workspace pass straight through to the Next.js
+    // Route Handlers that run the real agent engine against Aurora.
     const pathname = request.nextUrl.pathname;
     const AUTH_ROUTE_ROOTS = [
       '/login',
@@ -94,7 +95,7 @@ export async function proxy(request: NextRequest) {
       AUTH_ROUTE_ROOTS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
     if (isAuthRoute) {
       const url = request.nextUrl.clone();
-      url.pathname = '/h0';
+      url.pathname = '/workspace';
       url.search = '';
       return NextResponse.redirect(url);
     }

@@ -1,4 +1,4 @@
-import type { AgentTrace, SubscriptionTier, ToolOutcome } from '@jak-swarm/shared';
+import type { AgentTrace, SubscriptionTier, ToolOutcome, WorkflowPlan } from '@jak-swarm/shared';
 import { generateId, generateTraceId } from '@jak-swarm/shared';
 import type { ToolCategory } from '@jak-swarm/shared';
 
@@ -148,6 +148,37 @@ export type AgentActivityEvent =
       inputSummary: string;
       /** Hash of the proposed input for ApprovalRequest payload binding. */
       proposedDataHash?: string;
+      timestamp: string;
+    }
+  // Cockpit-critical graph events. Emitted by the planner/worker graph nodes
+  // (not BaseAgent) so the chat cockpit's live agent graph + plan render before
+  // the first tool call. The swarm-execution.service.ts onAgentActivity handler
+  // forwards each to the SSE stream as plan_created / worker_started /
+  // worker_completed. These are intentionally part of the same union the
+  // activity emitter carries (the worker-node already calls onActivity directly).
+  | {
+      type: 'plan_created';
+      /** The full plan produced by the Planner (task list the cockpit renders). */
+      plan: WorkflowPlan;
+      /** Stable plan id (typically `${workflowId}-plan`). */
+      planId?: string;
+      timestamp: string;
+    }
+  | {
+      type: 'worker_started';
+      agentRole: string;
+      taskId: string;
+      taskName?: string;
+      timestamp: string;
+    }
+  | {
+      type: 'worker_completed';
+      agentRole: string;
+      taskId: string;
+      taskName?: string;
+      success: boolean;
+      durationMs: number;
+      error?: string;
       timestamp: string;
     };
 

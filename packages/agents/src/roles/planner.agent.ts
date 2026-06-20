@@ -73,6 +73,7 @@ Rules:
 - 3-10 tasks max. Don't over-fragment.
 - requiresApproval=true for any SEND, CRM write, payment, or external publish.
 - HIGH/CRITICAL risk always requires approval.
+- EXTERNAL SEND RULE (critical): whenever the goal asks to send/transmit/deliver/post/publish to an outside party (an email recipient, a customer, a public channel, an external system), the act of SENDING must be its OWN task — separate from any drafting task — with riskLevel="HIGH" and requiresApproval=true. The drafting task may be LOW/MEDIUM; the send/deliver task is always HIGH and requires approval. Do NOT fold the send into the drafting task.
 - retryable=false for destructive tasks (sends, deletes, payments).
 - If "PREFER these worker agents: X, Y" appears in the goal, bias tasks toward X and Y.
 - Every plan must have at least one user-facing deliverable task.`;

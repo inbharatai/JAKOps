@@ -82,6 +82,21 @@ export function afterVerifier(state: SwarmState): NodeName {
     }
   }
 
+  const task = getCurrentTask(state);
+  if (!task) {
+    return '__end__';
+  }
+
+  // The verifier wrapper bumps `currentTaskIndex` to point at the NEXT task to
+  // process when it decides there is more work. LangGraph's conditional edge
+  // re-invokes this function AFTER applying that bump, so the current task at
+  // the (now-bumped) index has NOT been verified yet. An unverified current
+  // task still needs the guardrail → worker → verifier cycle, so route to
+  // guardrail rather than treating the bumped index as "past the end".
+  if (!currentResult) {
+    return 'guardrail';
+  }
+
   if (hasMoreTasks(state)) {
     return 'guardrail';
   }

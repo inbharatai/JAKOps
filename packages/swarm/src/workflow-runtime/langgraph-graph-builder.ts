@@ -222,6 +222,16 @@ interface NodeDeps {
   shouldStop?: (workflowId: string) => boolean;
   /** Manual pause flag. */
   shouldPause?: (workflowId: string) => boolean;
+  /**
+   * True only when a real persistent checkpointer (Aurora/Postgres Prisma
+   * client) was supplied to SwarmRunner. When false (the in-memory stub
+   * used by the serverless stream route), `interrupt()` cannot persist a
+   * resumable pause, so the approval wrapper skips it and lets the
+   * approval node's `AWAITING_APPROVAL` return end the graph naturally
+   * (pragmatic serverless pause + decide-route completion). Preserves
+   * the original `apps/api` true-resume path, which passes a real db.
+   */
+  hasPersistentCheckpointer?: boolean;
 }
 
 /**
@@ -333,9 +343,23 @@ function wrapApprovalNode(deps: NodeDeps) {
       return updates;
     }
 
-    // Pause via LangGraph interrupt(). The interrupt VALUE carries the
-    // pending approval(s) so the resume side can show them. The interrupt
-    // RESUME VALUE must be { approvalId, status: 'APPROVED'|'REJECTED', reviewedBy, comment? }.
+    // Serverless / in-memory checkpointer path: `interrupt()` cannot
+    // persist a resumable pause (it discards this node's writes and
+    // returns the pre-approval state instead of throwing GraphInterrupt).
+    // Skip it and let the approval node's `AWAITING_APPROVAL` +
+    // `pendingApprovals` return end the graph naturally — afterApproval
+    // routes PENDING approvals to END, so the workflow lands in
+    // AWAITING_APPROVAL with the real ApprovalRequest committed to state.
+    // The decide route then completes the workflow on human approval.
+    if (!deps.hasPersistentCheckpointer) {
+      return updates;
+    }
+
+    // Persistent-checkpointer path (original apps/api): pause via LangGraph
+    // interrupt() so the graph suspends and resume() rehydrates from the
+    // checkpointer. The interrupt VALUE carries the pending approval(s) so
+    // the resume side can show them. The interrupt RESUME VALUE must be
+    // { approvalId, status: 'APPROVED'|'REJECTED', reviewedBy, comment? }.
     const lastApproval = postState.pendingApprovals[postState.pendingApprovals.length - 1];
     const decision = interrupt<
       {
@@ -417,12 +441,15 @@ export interface BuildLangGraphParams {
   db: CheckpointPrismaClient;
   shouldStop?: (workflowId: string) => boolean;
   shouldPause?: (workflowId: string) => boolean;
+  /** See NodeDeps.hasPersistentCheckpointer. */
+  hasPersistentCheckpointer?: boolean;
 }
 
 export function buildLangGraph(params: BuildLangGraphParams) {
   const deps: NodeDeps = {
     shouldStop: params.shouldStop,
     shouldPause: params.shouldPause,
+    hasPersistentCheckpointer: params.hasPersistentCheckpointer === true,
   };
   const checkpointer = new PostgresCheckpointSaver(params.db);
 

@@ -119,9 +119,10 @@ export async function guardrailNode(state: SwarmState): Promise<Partial<SwarmSta
   }
 
   if (!result.safe) {
+    const blocked = result.injectionAttempted || result.blockedAction !== undefined;
     return {
       guardrailResult: result,
-      blocked: result.injectionAttempted || result.blockedAction !== undefined,
+      blocked,
       error: result.violations.join('; '),
       status: result.injectionAttempted ? WorkflowStatus.FAILED : WorkflowStatus.EXECUTING,
       traces: context.getTraces(),

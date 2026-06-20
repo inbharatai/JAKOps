@@ -5,6 +5,7 @@ import type { AuthUser } from '@/types';
 import { createClient } from './supabase';
 import type { User as SupabaseUser, SupabaseClient } from '@supabase/supabase-js';
 import { normalizeSupabaseProjectUrl } from './supabase-url';
+import { isH0DemoMode, getH0DemoUser } from './h0-demo';
 
 let _supabase: SupabaseClient | null = null;
 function getClient(): SupabaseClient {
@@ -39,6 +40,21 @@ const DEV_BYPASS_USER: AuthUser = {
   // imposes no restricted-tool list, matching GENERAL semantics.
   industry: 'TECHNOLOGY',
 };
+
+/**
+ * H0 demo / contest mode — "preconfigured demo workspace for instant judge
+ * access". When active (H0_DEMO_MODE on, or Supabase simply isn't configured)
+ * the auth hooks short-circuit to this preconfigured user so the real /workspace
+ * cockpit renders with zero login. No Supabase session and no backend /auth/me
+ * call is ever made. The dashboard layout's "redirect to /login when no user"
+ * check is satisfied because `user` is non-null from the first render.
+ */
+const DEMO_AUTH_USER: AuthUser = getH0DemoUser() as AuthUser;
+
+/** True when the app should skip all real auth and serve the preconfigured demo workspace. */
+function isDemoAuthActive(): boolean {
+  return isH0DemoMode() || !hasUsableSupabaseConfig();
+}
 
 // ─── Map Supabase user to JAK AuthUser ──────────────────────────────────────
 
@@ -245,6 +261,12 @@ export function clearToken(): void {
 export function getRawToken(): string | null {
   // For backward compat with api-client.ts
   if (typeof window === 'undefined') return null;
+  // Contest / demo mode: there is no real session, but the chat cockpit's SSE
+  // client (sse-fetch.ts) refuses to connect on an empty token. Return a
+  // stable, harmless sentinel so connectSSE proceeds to the same-origin
+  // stream route. The Next.js Route Handlers ignore the Authorization header
+  // in demo mode (no auth check).
+  if (isDemoAuthActive()) return 'demo';
   // Supabase stores the session — we can get the access token from it
   return window.localStorage.getItem(JAK_TOKEN_KEY) ?? window.localStorage.getItem('jak_token');
 }
@@ -254,6 +276,7 @@ export function getRawToken(): string | null {
 export function isAuthenticated(): boolean {
   if (typeof window === 'undefined') return false;
   if (DEV_BYPASS_ACTIVE) return true;
+  if (isDemoAuthActive()) return true;
   if (getRawToken()) return true;
   // Sync check: Supabase stores auth tokens in localStorage
   const storageKey = Object.keys(localStorage).find(k => k.startsWith('sb-') && k.endsWith('-auth-token'));
@@ -599,6 +622,10 @@ export function useAuthSession(): AuthSessionState {
     if (DEV_BYPASS_ACTIVE) {
       return createAuthSessionState(DEV_BYPASS_USER, null, false);
     }
+    // Contest / demo mode: preconfigured demo workspace, no Supabase session.
+    if (isDemoAuthActive()) {
+      return createAuthSessionState(DEMO_AUTH_USER, null, false);
+    }
     // Try JAK's own stored user first (already fully hydrated)
     const storedUser = getStoredJakUser();
     if (storedUser) {
@@ -614,6 +641,7 @@ export function useAuthSession(): AuthSessionState {
 
   useEffect(() => {
     if (DEV_BYPASS_ACTIVE) return;
+    if (isDemoAuthActive()) return;
 
     if (!hasUsableSupabaseConfig()) {
       setState(createAuthSessionState(null, null, false));
@@ -724,6 +752,8 @@ function getAccessTokenSync(): string | null {
 export function useAuthProfile(): AuthProfileState {
   const [state, setState] = useState<AuthProfileState>(() => {
     if (DEV_BYPASS_ACTIVE) return createAuthProfileState(DEV_BYPASS_USER, false, null);
+    // Contest / demo mode: preconfigured demo workspace, no /auth/me call.
+    if (isDemoAuthActive()) return createAuthProfileState(DEMO_AUTH_USER, false, null);
     // Try cached user from localStorage — avoids network hop on repeat visits
     const storedUser = getStoredJakUser();
     if (storedUser) return createAuthProfileState(storedUser, false, null);
@@ -734,6 +764,7 @@ export function useAuthProfile(): AuthProfileState {
 
   useEffect(() => {
     if (DEV_BYPASS_ACTIVE) return;
+    if (isDemoAuthActive()) return;
 
     // Read token synchronously from localStorage (not React state)
     const initialToken = getAccessTokenSync();
