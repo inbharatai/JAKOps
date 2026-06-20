@@ -84,6 +84,23 @@ export async function workerNode(state: SwarmState): Promise<Partial<SwarmState>
     ...(state.openaiWebSearch !== undefined ? { openaiWebSearch: state.openaiWebSearch } : {}),
   });
 
+  // Emit worker_started so the chat cockpit lights up this task's node the
+  // instant the worker begins (before any tool call). Fire-and-forget.
+  const workerStartedAt = Date.now();
+  try {
+    if (onActivity) {
+      onActivity({
+        type: 'worker_started',
+        agentRole: task.agentRole,
+        taskId: task.id,
+        ...(task.name ? { taskName: task.name } : {}),
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } catch {
+    // non-fatal
+  }
+
   let output: unknown;
   let taskFailed = false;
 
@@ -253,6 +270,31 @@ export async function workerNode(state: SwarmState): Promise<Partial<SwarmState>
   }
 
   const traces = context.getTraces();
+
+  // Emit worker_completed so the cockpit marks this task's node done with its
+  // real duration + success/error. Fire-and-forget — never break the worker.
+  try {
+    if (onActivity) {
+      onActivity({
+        type: 'worker_completed',
+        agentRole: task.agentRole,
+        taskId: task.id,
+        ...(task.name ? { taskName: task.name } : {}),
+        success: !taskFailed,
+        durationMs: Date.now() - workerStartedAt,
+        ...(taskFailed
+          ? {
+              error: String(
+                (output as Record<string, unknown>)['error'] ?? 'Worker failed',
+              ),
+            }
+          : {}),
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } catch {
+    // non-fatal
+  }
 
   const updatedPlan = state.plan
     ? {

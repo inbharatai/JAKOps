@@ -260,10 +260,9 @@ export default function H0Dashboard() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Pill className="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">H0 Demo</Pill>
               <Pill className="border-white/15 bg-white/5 text-slate-300">Vercel</Pill>
               <Pill className="border-sky-500/30 bg-sky-500/10 text-sky-300">Amazon Aurora PostgreSQL</Pill>
-              <Pill className="border-amber-500/30 bg-amber-500/10 text-amber-300">Preconfigured Demo Workspace</Pill>
+              <Pill className="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">Live</Pill>
             </div>
           </div>
         </div>
@@ -299,7 +298,7 @@ export default function H0Dashboard() {
               disabled={running}
               className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-emerald-400 to-amber-400 px-4 py-2 text-sm font-semibold text-[#09090b] transition hover:opacity-90 disabled:opacity-50"
             >
-              {running ? 'Running…' : '▶ Run Demo Workflow'}
+              {running ? 'Running…' : '▶ Run Workflow'}
             </button>
           </div>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
@@ -338,7 +337,7 @@ export default function H0Dashboard() {
                 {workflows.length === 0 && (
                   <tr>
                     <td colSpan={8} className="px-3 py-8 text-center text-slate-500">
-                      No workflows yet. Click <span className="text-emerald-300">Run Demo Workflow</span> to write records into Aurora.
+                      No workflows yet. Click <span className="text-emerald-300">Run Workflow</span> to run a real agent workflow against Aurora.
                     </td>
                   </tr>
                 )}
@@ -529,8 +528,7 @@ export default function H0Dashboard() {
         </section>
 
         <footer className="mt-10 border-t border-white/10 pt-6 text-xs text-slate-500">
-          JackOps · H0: Hack the Zero Stack with Vercel v0 and AWS Databases · Vercel + Amazon Aurora PostgreSQL ·
-          preconfigured demo workspace for instant judge access (no signup required).
+          JackOps · AI operations command center · Vercel + Amazon Aurora PostgreSQL.
         </footer>
       </main>
     </div>

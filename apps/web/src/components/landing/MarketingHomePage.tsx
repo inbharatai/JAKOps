@@ -367,11 +367,13 @@ export default function MarketingHomePage() {
                   }
                 </svg>
               </button>
-              {/* Sign In is hidden on mobile to free up horizontal space —
-                  it lives inside the mobile menu dropdown instead. Also
-                  whitespace-nowrap so "Sign In" never wraps on tablet. */}
-              <Link href="/login" className="hidden sm:inline-flex text-sm font-medium text-slate-400 hover:text-white focus-visible:text-white transition-colors whitespace-nowrap">
-                Sign In
+              {/* "Try Demo" takes a judge straight into the live operations
+                  cockpit. No login form — demo mode serves a preconfigured
+                  workspace (see apps/web/src/lib/auth.ts). Hidden on mobile
+                  where it lives in the menu dropdown; whitespace-nowrap so
+                  "Try Demo" never wraps on tablet. */}
+              <Link href="/workspace" className="hidden sm:inline-flex text-sm font-medium text-slate-400 hover:text-white focus-visible:text-white transition-colors whitespace-nowrap">
+                Try Demo
               </Link>
               <Link href="/register" className="inline-flex items-center gap-1.5 rounded-lg px-3 sm:px-4 py-2 text-sm font-semibold text-[#09090b] transition-all duration-200 hover:opacity-90 focus-visible:ring-2 focus-visible:ring-emerald-400 whitespace-nowrap" style={{ background: 'linear-gradient(135deg, #34d399, #fbbf24)', touchAction: 'manipulation' }}>
                 Get Started
@@ -398,9 +400,9 @@ export default function MarketingHomePage() {
               <a href="#trust" onClick={() => setMobileMenuOpen(false)} className="block text-sm text-slate-400 hover:text-white transition-colors">Trust</a>
               <a href="#pricing" onClick={() => setMobileMenuOpen(false)} className="block text-sm text-slate-400 hover:text-white transition-colors">Pricing</a>
               <Link href="/builder" onClick={() => setMobileMenuOpen(false)} className="block text-sm text-emerald-400 hover:text-emerald-300 transition-colors">Builder</Link>
-              {/* Sign In moved here from the top bar so the brand + Get Started
+              {/* "Try Demo" moved here from the top bar so the brand + Get Started
                   have room to breathe without wrapping on 375px viewports. */}
-              <Link href="/login" onClick={() => setMobileMenuOpen(false)} className="block text-sm text-slate-300 hover:text-white transition-colors pt-2 border-t border-white/5">Sign In</Link>
+              <Link href="/workspace" onClick={() => setMobileMenuOpen(false)} className="block text-sm text-slate-300 hover:text-white transition-colors pt-2 border-t border-white/5">Try Demo</Link>
             </div>
           )}
         </nav>

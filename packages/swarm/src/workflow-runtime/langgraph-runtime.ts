@@ -51,7 +51,7 @@ export class LangGraphRuntime implements WorkflowRuntime {
   private readonly graph: CompiledLangGraph;
   private readonly runner: SwarmRunner;
 
-  constructor(runner: SwarmRunner, db: CheckpointPrismaClient) {
+  constructor(runner: SwarmRunner, db: CheckpointPrismaClient, hasPersistentCheckpointer = false) {
     this.runner = runner;
     // Wire cooperative cancel/pause flags from the SwarmRunner to the
     // graph's per-node wrappers. We reuse the SwarmRunner's flag sets
@@ -62,6 +62,7 @@ export class LangGraphRuntime implements WorkflowRuntime {
       db,
       shouldStop: (id) => runner.isCancelled(id),
       shouldPause: (id) => runner.isPaused(id),
+      hasPersistentCheckpointer,
     });
   }
 

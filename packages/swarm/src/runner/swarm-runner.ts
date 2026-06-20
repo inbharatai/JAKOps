@@ -212,7 +212,7 @@ export class SwarmRunner {
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? 20 * 60 * 1000;
     this.maxConcurrent = options.maxConcurrentWorkflows ?? 20;
     this.stateStore = options.stateStore ?? new InMemoryStateStore();
-    this.runtime = new LangGraphRuntime(this, options.db ?? makeInMemoryCheckpointDb());
+    this.runtime = new LangGraphRuntime(this, options.db ?? makeInMemoryCheckpointDb(), !!options.db);
   }
 
   pause(workflowId: string): void {
